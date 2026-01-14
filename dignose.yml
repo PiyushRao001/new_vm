@@ -1,5 +1,5 @@
 ---
-- name: Production VM Snapshot Safety - WORKING VERSION
+- name: Production VM Snapshot Safety - FINAL CORRECTED
   hosts: all
   gather_facts: no
   connection: local
@@ -19,7 +19,7 @@
 
   tasks:
     # -------------------------------------------------------------------------
-    # STEP 1: GET VM INFO (INCLUDING UUID)
+    # STEP 1: GET VM INFO
     # -------------------------------------------------------------------------
     - name: Fetch VM Facts
       community.vmware.vmware_guest_info:
@@ -38,8 +38,12 @@
       delegate_to: localhost
       register: vm_facts
 
+    - name: Set VM UUID fact
+      set_fact:
+        vm_uuid: "{{ vm_facts.instance.config.instanceUuid }}"
+
     # -------------------------------------------------------------------------
-    # STEP 2: CHECK EXISTING SNAPSHOTS (USING UUID - NO FOLDER NEEDED)
+    # STEP 2: CHECK EXISTING SNAPSHOTS (USING UUID)
     # -------------------------------------------------------------------------
     - name: Check existing snapshots using UUID
       community.vmware.vmware_guest_snapshot_info:
@@ -48,7 +52,7 @@
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
-        uuid: "{{ vm_facts.instance.hw_product_uuid }}"
+        uuid: "{{ vm_uuid }}"
       delegate_to: localhost
       register: snapshot_info
       ignore_errors: yes
@@ -177,7 +181,7 @@
         msg:
           - "=========================================="
           - "HOST          : {{ inventory_hostname }}"
-          - "UUID          : {{ vm_facts.instance.hw_product_uuid }}"
+          - "UUID          : {{ vm_uuid }}"
           - "POWER STATE   : {{ 'PASS ✓' if check_power | default(false) else 'FAIL ✗' }}"
           - "DATASTORE(S)  : {{ 'PASS ✓' if check_space | default(false) else 'FAIL ✗' }}"
           - "SNAPSHOT EXISTS: {{ 'YES' if snapshot_exists else 'NO' }}"
@@ -194,7 +198,7 @@
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
-        uuid: "{{ vm_facts.instance.hw_product_uuid }}"
+        uuid: "{{ vm_uuid }}"
         state: present
         snapshot_name: "{{ snapshot_name }}"
         description: "{{ snapshot_desc }}"
