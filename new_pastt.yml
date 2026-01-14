@@ -218,20 +218,20 @@
 
         - name: Display datastore space analysis
           debug:
-            msg:
-              - "=========================================="
-              - "Datastore Space Analysis for {{ vm_name }}"
-              - "=========================================="
-              - "{% for ds in datastore_checks %}"
-              - "Datastore: {{ ds.name }}"
-              - "  VM Committed   : {{ ds.vm_committed_gb }} GB"
-              - "  Required Space : {{ ds.required_space_gb }} GB (with {{ safety_margin_gb }} GB margin)"
-              - "  DS Capacity    : {{ ds.ds_capacity_gb }} GB"
-              - "  DS Free Space  : {{ ds.ds_free_gb }} GB"
-              - "  Status         : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT' }}"
-              - "---"
-              - "{% endfor %}"
-              - "=========================================="
+            msg: |
+              ==========================================
+              Datastore Space Analysis for {{ vm_name }}
+              ==========================================
+              {% for ds in datastore_checks %}
+              Datastore: {{ ds.name }}
+                VM Committed   : {{ ds.vm_committed_gb }} GB
+                Required Space : {{ ds.required_space_gb }} GB (with {{ safety_margin_gb }} GB margin)
+                DS Capacity    : {{ ds.ds_capacity_gb }} GB
+                DS Free Space  : {{ ds.ds_free_gb }} GB
+                Status         : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT' }}
+              ---
+              {% endfor %}
+              ==========================================
 
         - name: Check if ALL datastores have sufficient space
           set_fact:
