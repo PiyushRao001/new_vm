@@ -5,41 +5,66 @@
   connection: local
 
   vars:
-    snapshot_name: "{{ snapshot_name | default('Pre-Patch-Snapshot') }}"
-    snapshot_desc: "{{ snapshot_desc | default('Created by Ansible AWX for Maintenance') }}"
-    vcenter_hostname: "{{ vcenter_hostname | default(lookup('env', 'VCENTER_HOSTNAME')) }}"
-    vcenter_username: "{{ vcenter_username | default(lookup('env', 'VCENTER_USERNAME')) }}"
-    vcenter_password: "{{ vcenter_password | default(lookup('env', 'VCENTER_PASSWORD')) }}"
-    datacenter_name: "{{ datacenter_name | default(lookup('env', 'VCENTER_DATACENTER')) }}"
-    # Space buffer percentage (20% recommended for snapshots)
+    snapshot_name: "Pre-Patch-Snapshot"
+    snapshot_desc: "Created by Ansible AWX for Maintenance"
+    # Use direct environment variable lookup in validation
+    vcenter_hostname_env: "{{ lookup('env', 'VCENTER_HOSTNAME') | default('') }}"
+    vcenter_username_env: "{{ lookup('env', 'VCENTER_USERNAME') | default('') }}"
+    vcenter_password_env: "{{ lookup('env', 'VCENTER_PASSWORD') | default('') }}"
+    datacenter_name_env: "{{ lookup('env', 'VCENTER_DATACENTER') | default('') }}"
     space_buffer_pct: 1.2
 
   tasks:
     # -------------------------------------------------------------------------
-    # STEP 1: VALIDATE INPUTS (Important for AWX)
+    # STEP 1: SET VARIABLES WITH PROPER PRECEDENCE
+    # -------------------------------------------------------------------------
+    - name: Set vCenter variables with precedence
+      set_fact:
+        # Use extra_vars if provided, otherwise use environment variables
+        vcenter_hostname: "{{ vcenter_hostname | default(vcenter_hostname_env) }}"
+        vcenter_username: "{{ vcenter_username | default(vcenter_username_env) }}"
+        vcenter_password: "{{ vcenter_password | default(vcenter_password_env) }}"
+        datacenter_name: "{{ datacenter_name | default(datacenter_name_env) }}"
+      run_once: yes
+
+    # -------------------------------------------------------------------------
+    # STEP 2: VALIDATE INPUTS
     # -------------------------------------------------------------------------
     - name: Validate required variables
       fail:
         msg: |
-          Missing required variable: {{ item }}
-          Set in AWX as:
-          - Extra Variables OR
-          - Survey OR
-          - Environment Variables
+          Missing required vCenter configuration!
+          
+          Set the following in AWX:
+          
+          1. As Environment Variables in Credentials:
+             - VCENTER_HOSTNAME
+             - VCENTER_USERNAME  
+             - VCENTER_PASSWORD
+             - VCENTER_DATACENTER
+          
+          OR
+          
+          2. As Extra Variables in the Job Template:
+             - vcenter_hostname
+             - vcenter_username
+             - vcenter_password
+             - datacenter_name
+          
+          Current values:
+          - vcenter_hostname: {{ vcenter_hostname | default('NOT SET') }}
+          - vcenter_username: {{ vcenter_username | default('NOT SET') }}
+          - vcenter_password: {{ 'SET' if vcenter_password is defined else 'NOT SET' }}
+          - datacenter_name: {{ datacenter_name | default('NOT SET') }}
       when: >
         (vcenter_hostname | default('')) == '' or
         (vcenter_username | default('')) == '' or
         (vcenter_password | default('')) == '' or
         (datacenter_name | default('')) == ''
-      loop:
-        - vcenter_hostname
-        - vcenter_username
-        - vcenter_password
-        - datacenter_name
       run_once: yes
 
     # -------------------------------------------------------------------------
-    # STEP 2: GET VM INFORMATION
+    # STEP 3: GET VM INFORMATION
     # -------------------------------------------------------------------------
     - name: Get VM information from vCenter
       vmware_vm_info:
@@ -54,32 +79,33 @@
       ignore_errors: yes
       failed_when: >
         vm_info.failed and 
-        'not found' not in vm_info.msg | default('') and
-        'Unable to find' not in vm_info.msg | default('')
+        'not found' not in (vm_info.msg | default('')) and
+        'Unable to find' not in (vm_info.msg | default(''))
 
     - name: Fail if VM not found
       fail:
-        msg: "VM '{{ inventory_hostname }}' not found in vCenter {{ vcenter_hostname }}"
+        msg: "VM '{{ inventory_hostname }}' not found in vCenter {{ vcenter_hostname }} (Datacenter: {{ datacenter_name }})"
       when: vm_info.failed | default(false)
 
     - name: Extract VM facts
       set_fact:
         vm_moid: "{{ vm_info.virtual_machines[0].moid }}"
         vm_power_state: "{{ vm_info.virtual_machines[0].power_state }}"
-        vm_storage_mb: "{{ vm_info.virtual_machines[0].disk_sizes | sum }}"
-        vm_datastores: "{{ vm_info.virtual_machines[0].datastore }}"
-        vm_guest_name: "{{ vm_info.virtual_machines[0].guest_name }}"
+        vm_storage_mb: "{{ vm_info.virtual_machines[0].disk_sizes | sum | default(0) }}"
+        vm_datastores: "{{ vm_info.virtual_machines[0].datastore | default([]) }}"
+        vm_guest_name: "{{ vm_info.virtual_machines[0].guest_name | default(inventory_hostname) }}"
       when: vm_info.virtual_machines | length > 0
 
     # -------------------------------------------------------------------------
-    # STEP 3: CHECK POWER STATE
+    # STEP 4: CHECK POWER STATE
     # -------------------------------------------------------------------------
     - name: Set power state fact
       set_fact:
         is_powered_on: "{{ vm_power_state == 'poweredOn' }}"
+      when: vm_power_state is defined
 
     # -------------------------------------------------------------------------
-    # STEP 4: CHECK DATASTORE FREE SPACE
+    # STEP 5: CHECK DATASTORE FREE SPACE
     # -------------------------------------------------------------------------
     - name: Get datastore information
       vmware_datastore_info:
@@ -106,9 +132,7 @@
             {% set ns = namespace(found_space=false) %}
             {% for ds_name in vm_datastores %}
               {% set ds = ds_info.datastores | selectattr('name', 'equalto', ds_name) | first %}
-              {% if ds %}
-                {% set free_gb = (ds.free_space / (1024*1024*1024)) | round(2) %}
-                {% set needed_gb = (required_space_bytes / (1024*1024*1024)) | round(2) %}
+              {% if ds and ds.free_space is defined %}
                 {% if ds.free_space > required_space_bytes %}
                   {% set ns.found_space = true %}
                 {% endif %}
@@ -124,7 +148,7 @@
         - required_space_bytes is defined
 
     # -------------------------------------------------------------------------
-    # STEP 5: PRE-FLIGHT SUMMARY (AWX Friendly Output)
+    # STEP 6: PRE-FLIGHT SUMMARY
     # -------------------------------------------------------------------------
     - name: Display pre-flight check results
       debug:
@@ -132,8 +156,8 @@
           ==========================================
           VM PRE-FLIGHT CHECK - {{ inventory_hostname }}
           ==========================================
-          VM Name: {{ vm_guest_name | default(inventory_hostname) }}
-          Power State: {{ vm_power_state }} ({{ '✓ READY' if is_powered_on else '✗ SKIP - Powered off' }})
+          VM Name: {{ vm_guest_name }}
+          Power State: {{ vm_power_state }} ({{ '✓ READY' if is_powered_on | default(false) else '✗ SKIP - Powered off' }})
           Total Storage: {{ vm_storage_mb | default(0) }} MB
           
           DATASTORE CHECK:
@@ -141,56 +165,64 @@
             {% for ds_name in vm_datastores %}
             - {{ ds_name }}:
               {% set ds = ds_info.datastores | selectattr('name', 'equalto', ds_name) | first %}
-              {% if ds %}
+              {% if ds and ds.free_space is defined %}
                 Free: {{ (ds.free_space / (1024*1024*1024)) | round(2) }} GB
                 Needed: {{ required_space_gb | default('N/A') }} GB (with {{ ((space_buffer_pct - 1) * 100) | int }}% buffer)
                 Status: {{ '✓ SUFFICIENT' if ds.free_space > required_space_bytes else '✗ INSUFFICIENT' }}
               {% else %}
-                ✗ NOT FOUND IN VCENTER
+                ✗ NOT FOUND OR NO FREE SPACE INFO
               {% endif %}
             {% endfor %}
           {% else %}
             ✗ NO DATASTORES FOUND
           {% endif %}
           
-          OVERALL STATUS: {{ '✓ READY FOR SNAPSHOT' if is_powered_on and has_enough_space else '✗ NOT READY' }}
+          OVERALL STATUS: {{ '✓ READY FOR SNAPSHOT' if (is_powered_on | default(false)) and (has_enough_space | default(false)) else '✗ NOT READY' }}
           ==========================================
       when: vm_info is defined and not vm_info.failed
 
     # -------------------------------------------------------------------------
-    # STEP 6: CREATE SNAPSHOT (Only if conditions met)
+    # STEP 7: CREATE SNAPSHOT
     # -------------------------------------------------------------------------
-    - name: Create VM snapshot
-      vmware_guest_snapshot:
-        hostname: "{{ vcenter_hostname }}"
-        username: "{{ vcenter_username }}"
-        password: "{{ vcenter_password }}"
-        validate_certs: no
-        datacenter: "{{ datacenter_name }}"
-        folder: "/"
-        name: "{{ inventory_hostname }}"
-        state: present
-        snapshot_name: "{{ snapshot_name }}"
-        description: "{{ snapshot_desc }}"
-        quiesce: no
-        memory_dump: no
-      delegate_to: localhost
-      register: snapshot_result
+    - block:
+        - name: Create VM snapshot
+          vmware_guest_snapshot:
+            hostname: "{{ vcenter_hostname }}"
+            username: "{{ vcenter_username }}"
+            password: "{{ vcenter_password }}"
+            validate_certs: no
+            datacenter: "{{ datacenter_name }}"
+            folder: "/"
+            name: "{{ inventory_hostname }}"
+            state: present
+            snapshot_name: "{{ snapshot_name }}"
+            description: "{{ snapshot_desc }}"
+            quiesce: no
+            memory_dump: no
+          delegate_to: localhost
+          register: snapshot_result
+
+        - name: Record successful snapshot
+          set_fact:
+            snapshot_created: true
+          when: snapshot_result.changed
+
       when:
         - is_powered_on | default(false)
         - has_enough_space | default(false)
-      ignore_errors: yes
+      rescue:
+        - name: Handle snapshot creation error
+          debug:
+            msg: |
+              ==========================================
+              ✗ SNAPSHOT CREATION FAILED
+              VM: {{ inventory_hostname }}
+              Error: {{ snapshot_result.msg | default('Unknown error') }}
+              ==========================================
 
     # -------------------------------------------------------------------------
-    # STEP 7: POST-EXECUTION REPORTING
+    # STEP 8: FINAL REPORTING
     # -------------------------------------------------------------------------
-    - name: Record successful snapshot
-      set_fact:
-        snapshot_created: true
-      when:
-        - snapshot_result is defined
-        - snapshot_result.changed
-
     - name: Display success message
       debug:
         msg: |
@@ -201,18 +233,6 @@
           Time: {{ ansible_date_time.iso8601 }}
           ==========================================
       when: snapshot_created | default(false)
-
-    - name: Display failure message
-      debug:
-        msg: |
-          ==========================================
-          ✗ SNAPSHOT CREATION FAILED
-          VM: {{ inventory_hostname }}
-          Error: {{ snapshot_result.msg | default('Unknown error') }}
-          ==========================================
-      when:
-        - snapshot_result is defined
-        - snapshot_result.failed | default(false)
 
     - name: Display skip reasons
       debug:
@@ -227,31 +247,7 @@
           {% if not (has_enough_space | default(false)) %}
           - Insufficient datastore space
           {% endif %}
-          {% if not (is_powered_on | default(false)) and not (has_enough_space | default(false)) %}
-          - Both: powered off AND insufficient space
-          {% endif %}
           ==========================================
-      when: not (is_powered_on | default(false) and has_enough_space | default(false))
-
-    # -------------------------------------------------------------------------
-    # STEP 8: FINAL SUMMARY FOR AWX JOB OUTPUT
-    # -------------------------------------------------------------------------
-    - name: Final job summary
-      set_fact:
-        job_summary: >-
-          {% if snapshot_created | default(false) %}
-          SUCCESS: Snapshot created for {{ inventory_hostname }}
-          {% elif not is_powered_on | default(false) %}
-          SKIPPED: {{ inventory_hostname }} is powered off
-          {% elif not has_enough_space | default(false) %}
-          SKIPPED: Insufficient datastore space for {{ inventory_hostname }}
-          {% elif snapshot_result.failed | default(false) %}
-          FAILED: {{ snapshot_result.msg | default('Unknown error') }}
-          {% else %}
-          UNKNOWN: No action taken for {{ inventory_hostname }}
-          {% endif %}
-
-    - name: Print final summary
-      debug:
-        msg: "{{ job_summary }}"
-      run_once: yes
+      when: 
+        - not (is_powered_on | default(false) and has_enough_space | default(false))
+        - not snapshot_created | default(false)
