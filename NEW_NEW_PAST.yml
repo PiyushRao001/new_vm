@@ -175,7 +175,7 @@
       block:
         - name: Calculate required space for snapshot (total VM storage + margin)
           set_fact:
-            required_snapshot_space_gb: "{{ (vm_total_committed_gb | float + safety_margin_gb | float) | round(2) }}"
+            required_snapshot_space_gb: "{{ ((vm_total_committed_gb | float) + (safety_margin_gb | float)) | round(2) | float }}"
 
         - name: Create datastore checks list
           set_fact:
@@ -241,7 +241,7 @@
                   
                   {{ ds.name }}:
                     Free Space : {{ ds.ds_free_gb }} GB
-                    Shortage   : {{ (required_snapshot_space_gb - ds.ds_free_gb) | round(2) }} GB
+                    Shortage   : {{ ((required_snapshot_space_gb | float) - (ds.ds_free_gb | float)) | round(2) }} GB
                   {% endfor %}
                   
                   At least ONE datastore needs {{ required_snapshot_space_gb }} GB free space.
