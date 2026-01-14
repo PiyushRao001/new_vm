@@ -1,17 +1,27 @@
 ---
-- name: Snapshot Diagnostic Test
+- name: Production VM Snapshot Safety - WORKING VERSION
   hosts: all
   gather_facts: no
   connection: local
 
   vars:
+    snapshot_name: "Snapshot for patching"
+    snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
+    
+    # Space buffer calculations
+    thick_disk_buffer: 0.15  # 15% for thick disks
+    thin_disk_buffer: 0.20   # 20% for thin disks
+
     vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
     vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
     vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
     datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
 
   tasks:
-    - name: Get VM Info
+    # -------------------------------------------------------------------------
+    # STEP 1: GET VM INFO (INCLUDING UUID)
+    # -------------------------------------------------------------------------
+    - name: Fetch VM Facts
       community.vmware.vmware_guest_info:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
@@ -19,79 +29,206 @@
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
         name: "{{ inventory_hostname }}"
+        schema: vsphere
+        properties:
+          - summary.storage
+          - summary.runtime
+          - datastore
+          - config.instanceUuid
       delegate_to: localhost
-      register: vm_info
+      register: vm_facts
 
-    - name: Display VM Details
+    # -------------------------------------------------------------------------
+    # STEP 2: CHECK EXISTING SNAPSHOTS (USING UUID - NO FOLDER NEEDED)
+    # -------------------------------------------------------------------------
+    - name: Check existing snapshots using UUID
+      community.vmware.vmware_guest_snapshot_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        uuid: "{{ vm_facts.instance.hw_product_uuid }}"
+      delegate_to: localhost
+      register: snapshot_info
+      ignore_errors: yes
+
+    - name: Determine if snapshot already exists
+      set_fact:
+        snapshot_exists: >-
+          {{
+            snapshot_info.guest_snapshots is defined and
+            snapshot_info.guest_snapshots.snapshots is defined and
+            (snapshot_info.guest_snapshots.snapshots | 
+            selectattr('name', 'equalto', snapshot_name) | 
+            list | length > 0)
+          }}
+
+    # -------------------------------------------------------------------------
+    # STEP 3: DATASTORE & DISK VALIDATION (ONLY IF NO SNAPSHOT)
+    # -------------------------------------------------------------------------
+    - block:
+        - name: Fetch Datastore Details
+          community.vmware.vmware_datastore_info:
+            hostname: "{{ vcenter_hostname }}"
+            username: "{{ vcenter_username }}"
+            password: "{{ vcenter_password }}"
+            validate_certs: no
+            datacenter: "{{ datacenter_name }}"
+          delegate_to: localhost
+          register: all_datastores
+
+        - name: Fetch VM Disk Information
+          community.vmware.vmware_guest_disk_info:
+            hostname: "{{ vcenter_hostname }}"
+            username: "{{ vcenter_username }}"
+            password: "{{ vcenter_password }}"
+            validate_certs: no
+            datacenter: "{{ datacenter_name }}"
+            name: "{{ inventory_hostname }}"
+          delegate_to: localhost
+          register: vm_disks
+
+        - name: Extract VM Datastore Names
+          set_fact:
+            vm_datastore_names: >-
+              {% if vm_facts.instance.datastore is string %}
+                {{ [vm_facts.instance.datastore] }}
+              {% elif vm_facts.instance.datastore[0] is string %}
+                {{ vm_facts.instance.datastore }}
+              {% else %}
+                {{ vm_facts.instance.datastore | map(attribute='name') | list }}
+              {% endif %}
+
+        - name: Calculate required space per datastore
+          set_fact:
+            ds_required_space: >-
+              {{
+                ds_required_space | default({}) |
+                combine({
+                  item.backing_datastore: (
+                    (ds_required_space[item.backing_datastore] | default(0) | int) +
+                    (
+                      (item.capacity_in_bytes | int * thick_disk_buffer)
+                      if not item.backing_thinprovisioned
+                      else (item.capacity_in_bytes | int * thin_disk_buffer)
+                    )
+                  )
+                })
+              }}
+          loop: "{{ vm_disks.guest_disk_info.values() | list }}"
+          when: vm_disks.guest_disk_info is defined
+
+        - name: Filter VM-attached datastores
+          set_fact:
+            vm_datastores: >-
+              {{
+                all_datastores.datastores
+                | selectattr('name', 'in', vm_datastore_names)
+                | list
+              }}
+
+        - name: Validate per-datastore free space
+          set_fact:
+            ds_space_check: >-
+              {{
+                ds_space_check | default({}) |
+                combine({
+                  item.name: (
+                    item.freeSpace | int > (ds_required_space[item.name] | default(0) | int)
+                  )
+                })
+              }}
+          loop: "{{ vm_datastores }}"
+
+        - name: Check ALL datastores pass
+          set_fact:
+            all_datastores_pass: >-
+              {{
+                ds_space_check.values() | list | 
+                reject('equalto', false) | list | length == 
+                ds_space_check.values() | list | length
+              }}
+
+        - name: Set validation flags
+          set_fact:
+            check_space: "{{ all_datastores_pass | default(false) }}"
+            check_power: "{{ vm_facts.instance.summary.runtime.powerState == 'poweredOn' }}"
+
+      when: not snapshot_exists
+
+    # -------------------------------------------------------------------------
+    # STEP 4: REPORTING
+    # -------------------------------------------------------------------------
+    - name: Datastore Space Report
+      debug:
+        msg:
+          - "Datastore     : {{ item.key }}"
+          - "Required Space: {{ (ds_required_space[item.key] | default(0) / 1073741824) | round(2) }} GB"
+          - "Free Space    : {{ ((vm_datastores | selectattr('name','equalto',item.key) | first).freeSpace / 1073741824) | round(2) }} GB"
+          - "Status        : {{ 'PASS ✓' if item.value else 'FAIL ✗' }}"
+      loop: "{{ ds_space_check | dict2items }}"
+      when:
+        - not snapshot_exists
+        - ds_space_check is defined
+
+    - name: Pre-flight summary
       debug:
         msg:
           - "=========================================="
-          - "VM Name       : {{ vm_info.instance.hw_name }}"
-          - "VM UUID       : {{ vm_info.instance.hw_product_uuid }}"
-          - "VM Folder     : {{ vm_info.instance.hw_folder | default('N/A') }}"
-          - "Power State   : {{ vm_info.instance.hw_power_status }}"
-          - "Guest OS      : {{ vm_info.instance.hw_guest_id }}"
-          - "VMware Tools  : {{ vm_info.instance.guest_tools_status | default('N/A') }}"
-          - "Is Template   : {{ vm_info.instance.hw_is_template | default(false) }}"
+          - "HOST          : {{ inventory_hostname }}"
+          - "UUID          : {{ vm_facts.instance.hw_product_uuid }}"
+          - "POWER STATE   : {{ 'PASS ✓' if check_power | default(false) else 'FAIL ✗' }}"
+          - "DATASTORE(S)  : {{ 'PASS ✓' if check_space | default(false) else 'FAIL ✗' }}"
+          - "SNAPSHOT EXISTS: {{ 'YES' if snapshot_exists else 'NO' }}"
+          - "ACTION        : {{ 'TAKING SNAPSHOT' if (check_power | default(false) and check_space | default(false) and not snapshot_exists) else 'SKIPPING' }}"
           - "=========================================="
 
-    - name: Test Snapshot Creation (Method 1 - UUID)
+    # -------------------------------------------------------------------------
+    # STEP 5: CREATE SNAPSHOT (USING UUID - NO FOLDER NEEDED!)
+    # -------------------------------------------------------------------------
+    - name: Create Snapshot using UUID
       community.vmware.vmware_guest_snapshot:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
-        uuid: "{{ vm_info.instance.hw_product_uuid }}"
+        uuid: "{{ vm_facts.instance.hw_product_uuid }}"
         state: present
-        snapshot_name: "TEST_SNAPSHOT_{{ ansible_date_time.epoch }}"
-        description: "Diagnostic test snapshot"
+        snapshot_name: "{{ snapshot_name }}"
+        description: "{{ snapshot_desc }}"
         quiesce: no
         memory_dump: no
       delegate_to: localhost
-      register: snapshot_uuid
-      ignore_errors: yes
+      when:
+        - not snapshot_exists
+        - check_power | default(false)
+        - check_space | default(false)
+      register: snapshot_result
 
-    - name: Display Method 1 Result
-      debug:
-        msg:
-          - "Method 1 (UUID): {{ 'SUCCESS ✓' if snapshot_uuid.changed else 'FAILED ✗' }}"
-          - "{{ snapshot_uuid.msg | default('') }}"
-
-    - name: Test Snapshot Creation (Method 2 - Name Only)
-      community.vmware.vmware_guest_snapshot:
-        hostname: "{{ vcenter_hostname }}"
-        username: "{{ vcenter_username }}"
-        password: "{{ vcenter_password }}"
-        validate_certs: no
-        datacenter: "{{ datacenter_name }}"
-        name: "{{ inventory_hostname }}"
-        state: present
-        snapshot_name: "TEST_SNAPSHOT_{{ ansible_date_time.epoch }}"
-        description: "Diagnostic test snapshot"
-        quiesce: no
-        memory_dump: no
-      delegate_to: localhost
-      register: snapshot_name
-      ignore_errors: yes
-      when: snapshot_uuid.failed | default(false)
-
-    - name: Display Method 2 Result
-      debug:
-        msg:
-          - "Method 2 (Name): {{ 'SUCCESS ✓' if snapshot_name.changed else 'FAILED ✗' }}"
-          - "{{ snapshot_name.msg | default('') }}"
-      when: snapshot_name is defined
-
-    - name: Final Diagnostic Summary
+    # -------------------------------------------------------------------------
+    # STEP 6: RESULTS
+    # -------------------------------------------------------------------------
+    - name: Snapshot success
       debug:
         msg:
           - "=========================================="
-          - "DIAGNOSTIC COMPLETE"
-          - "UUID Method   : {{ 'WORKS ✓' if snapshot_uuid.changed else 'FAILS ✗' }}"
-          - "Name Method   : {{ 'WORKS ✓' if (snapshot_name is defined and snapshot_name.changed) else 'FAILS ✗' if snapshot_name is defined else 'NOT TESTED' }}"
-          - ""
-          - "Errors:"
-          - "{{ snapshot_uuid.msg | default('None') }}"
-          - "{{ snapshot_name.msg | default('None') if snapshot_name is defined else '' }}"
+          - "✓ SUCCESS"
+          - "Snapshot '{{ snapshot_name }}' created for {{ inventory_hostname }}"
+          - "=========================================="
+      when:
+        - snapshot_result is defined
+        - snapshot_result.changed | default(false)
+
+    - name: Final Status Summary
+      debug:
+        msg:
+          - "=========================================="
+          - "FINAL STATUS: {{ inventory_hostname }}"
+          - "{{ '✓ Snapshot already existed' if snapshot_exists else '' }}"
+          - "{{ '✓ New snapshot created' if (snapshot_result is defined and snapshot_result.changed | default(false)) else '' }}"
+          - "{{ '✗ Snapshot failed' if (snapshot_result is defined and snapshot_result.failed | default(false)) else '' }}"
+          - "{{ 'ℹ Skipped - VM powered off' if (not snapshot_exists and not check_power | default(false)) else '' }}"
+          - "{{ 'ℹ Skipped - insufficient space' if (not snapshot_exists and not check_space | default(false)) else '' }}"
           - "=========================================="
