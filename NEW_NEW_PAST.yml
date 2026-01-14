@@ -169,58 +169,29 @@
       when: skip_space_check is not defined and vm_datastore_names | length > 0
 
     # -------------------------------------------------------------------------
-    # STEP 7: ANALYZE DATASTORE SPACE WITH ACTUAL VM STORAGE
+    # STEP 7: ANALYZE DATASTORE SPACE - COMPARE EACH DS FREE SPACE WITH TOTAL VM STORAGE
     # -------------------------------------------------------------------------
     - name: Analyze datastore space availability
       block:
+        - name: Calculate required space for snapshot (total VM storage + margin)
+          set_fact:
+            required_snapshot_space_gb: "{{ (vm_total_committed_gb | float + safety_margin_gb | float) | round(2) }}"
+
         - name: Create datastore checks list
           set_fact:
             datastore_checks: []
 
-        - name: Build datastore check information for each datastore
+        - name: Build datastore check information - compare DS free space with TOTAL VM storage
           set_fact:
             datastore_checks: >-
               {{
                 datastore_checks + [{
                   'name': vm_datastore_names[idx],
-                  'vim_ref': vm_datastore_refs[idx],
-                  'vm_committed_gb': (
-                    vm_storage_per_ds
-                    | selectattr('datastore', 'equalto', vm_datastore_refs[idx])
-                    | map(attribute='committed')
-                    | list
-                    | first
-                    | default(0)
-                    / 1073741824
-                  ) | round(2),
-                  'required_space_gb': (
-                    (
-                      vm_storage_per_ds
-                      | selectattr('datastore', 'equalto', vm_datastore_refs[idx])
-                      | map(attribute='committed')
-                      | list
-                      | first
-                      | default(0)
-                      / 1073741824
-                    ) + safety_margin_gb
-                  ) | round(2),
                   'ds_free_gb': ds_name_to_details[vm_datastore_names[idx]]['free_gb'],
                   'ds_capacity_gb': ds_name_to_details[vm_datastore_names[idx]]['capacity_gb'],
                   'has_space': (
                     ds_name_to_details[vm_datastore_names[idx]]['free_gb'] | float
-                  ) >= (
-                    (
-                      (
-                        vm_storage_per_ds
-                        | selectattr('datastore', 'equalto', vm_datastore_refs[idx])
-                        | map(attribute='committed')
-                        | list
-                        | first
-                        | default(0)
-                        / 1073741824
-                      ) + safety_margin_gb
-                    ) | float
-                  )
+                  ) >= (required_snapshot_space_gb | float)
                 }]
               }}
           loop: "{{ range(0, vm_datastore_names | length) | list }}"
@@ -234,25 +205,25 @@
               ==========================================
               Datastore Space Analysis for {{ vm_name }}
               ==========================================
-              VM Total Committed Storage: {{ vm_total_committed_gb }} GB
-              Safety Margin: {{ safety_margin_gb }} GB
+              VM Total Storage        : {{ vm_total_committed_gb }} GB (4.88 TB)
+              Required for Snapshot   : {{ required_snapshot_space_gb }} GB (VM storage + {{ safety_margin_gb }} GB margin)
+              
+              Checking if ANY datastore has >= {{ required_snapshot_space_gb }} GB free space:
               ---
               {% for ds in datastore_checks %}
               Datastore: {{ ds.name }}
-                VM Storage on this DS : {{ ds.vm_committed_gb }} GB
-                Required for Snapshot : {{ ds.required_space_gb }} GB (storage + margin)
-                DS Free Space         : {{ ds.ds_free_gb }} GB
-                DS Capacity           : {{ ds.ds_capacity_gb }} GB
-                Status                : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT - SNAPSHOT WILL BE SKIPPED' }}
+                DS Free Space  : {{ ds.ds_free_gb }} GB
+                DS Capacity    : {{ ds.ds_capacity_gb }} GB
+                Can fit VM?    : {{ '✓ YES - This datastore can hold the snapshot' if ds.has_space else '✗ NO - Free space < ' ~ required_snapshot_space_gb ~ ' GB' }}
               ---
               {% endfor %}
               ==========================================
 
-        - name: Check if ALL datastores have sufficient space
+        - name: Check if AT LEAST ONE datastore has sufficient space
           set_fact:
-            insufficient_datastores: "{{ datastore_checks | rejectattr('has_space', 'equalto', true) | list }}"
+            datastores_with_space: "{{ datastore_checks | selectattr('has_space', 'equalto', true) | list }}"
 
-        - name: Skip if any datastore has insufficient space
+        - name: Skip if NO datastore has sufficient space
           block:
             - debug:
                 msg: |
@@ -260,24 +231,25 @@
                   ⊘ SNAPSHOT CREATION SKIPPED
                   ==========================================
                   VM: {{ vm_name }}
-                  Reason: Insufficient free space on one or more datastores
-                  
                   VM Total Storage: {{ vm_total_committed_gb }} GB
+                  Required Space  : {{ required_snapshot_space_gb }} GB
                   
-                  Datastores with insufficient space:
-                  {% for ds in insufficient_datastores %}
+                  Reason: NO datastore has enough free space to hold the entire VM snapshot.
+                  
+                  Datastore free space summary:
+                  {% for ds in datastore_checks %}
                   
                   {{ ds.name }}:
-                    VM Storage        : {{ ds.vm_committed_gb }} GB
-                    Required Space    : {{ ds.required_space_gb }} GB
-                    Available Space   : {{ ds.ds_free_gb }} GB
-                    Shortage          : {{ (ds.required_space_gb - ds.ds_free_gb) | round(2) }} GB
+                    Free Space : {{ ds.ds_free_gb }} GB
+                    Shortage   : {{ (required_snapshot_space_gb - ds.ds_free_gb) | round(2) }} GB
                   {% endfor %}
+                  
+                  At least ONE datastore needs {{ required_snapshot_space_gb }} GB free space.
                   ==========================================
             - meta: end_host
-          when: insufficient_datastores | length > 0
+          when: datastores_with_space | length == 0
 
-        - name: All datastores have sufficient space
+        - name: At least one datastore has sufficient space
           debug:
             msg: |
               ==========================================
@@ -285,7 +257,13 @@
               ==========================================
               VM: {{ vm_name }}
               Total VM Storage: {{ vm_total_committed_gb }} GB
-              All {{ datastore_checks | length }} datastore(s) have sufficient free space
+              Required Space  : {{ required_snapshot_space_gb }} GB
+              
+              {{ datastores_with_space | length }} datastore(s) have sufficient space:
+              {% for ds in datastores_with_space %}
+              - {{ ds.name }}: {{ ds.ds_free_gb }} GB free
+              {% endfor %}
+              
               Proceeding with snapshot creation...
               ==========================================
 
