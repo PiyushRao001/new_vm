@@ -69,9 +69,9 @@
     # -------------------------------------------------------------------------
     - name: Extract VM storage information
       set_fact:
-        vm_total_committed_bytes: "{{ vm_info.instance.storage.committed }}"
-        vm_total_uncommitted_bytes: "{{ vm_info.instance.storage.uncommitted | default(0) }}"
         vm_storage_per_ds: "{{ vm_info.instance.storage.perDatastoreUsage }}"
+        vm_total_committed_bytes: "{{ vm_info.instance.storage.perDatastoreUsage | map(attribute='committed') | sum }}"
+        vm_total_uncommitted_bytes: "{{ vm_info.instance.storage.perDatastoreUsage | map(attribute='uncommitted') | sum | default(0) }}"
       when: vm_info.instance.storage is defined
 
     - name: Convert storage to GB
