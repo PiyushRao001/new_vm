@@ -1,5 +1,5 @@
 ---
-- name: VMware Snapshot Creation - Production Ready
+- name: VMware Snapshot Creation - WORKING SOLUTION
   hosts: all
   gather_facts: no
   connection: local
@@ -14,6 +14,9 @@
     datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
 
   tasks:
+    # -------------------------------------------------------------------------
+    # STEP 1: GET VM INFO (INCLUDING MOID)
+    # -------------------------------------------------------------------------
     - name: Get VM information
       community.vmware.vmware_guest_info:
         hostname: "{{ vcenter_hostname }}"
@@ -25,8 +28,12 @@
       delegate_to: localhost
       register: vm_info
 
-    - name: Check VM power state
+    # -------------------------------------------------------------------------
+    # STEP 2: EXTRACT CRITICAL INFO
+    # -------------------------------------------------------------------------
+    - name: Set VM facts
       set_fact:
+        vm_moid: "{{ vm_info.instance.moid }}"
         is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
 
     - name: Display pre-flight status
@@ -34,19 +41,23 @@
         msg:
           - "=========================================="
           - "VM            : {{ inventory_hostname }}"
+          - "MOID          : {{ vm_moid }}"
           - "Power State   : {{ vm_info.instance.hw_power_status }}"
           - "Datastore(s)  : {{ vm_info.instance.hw_datastore | join(', ') if vm_info.instance.hw_datastore is defined else 'N/A' }}"
-          - "Ready         : {{ 'YES' if is_powered_on else 'NO - VM is powered off' }}"
+          - "Ready         : {{ 'YES ✓' if is_powered_on else 'NO ✗ - VM is powered off' }}"
           - "=========================================="
 
-    - name: Create VM snapshot
+    # -------------------------------------------------------------------------
+    # STEP 3: CREATE SNAPSHOT USING MOID (NO FOLDER REQUIRED!)
+    # -------------------------------------------------------------------------
+    - name: Create VM snapshot using MOID
       community.vmware.vmware_guest_snapshot:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
-        name: "{{ inventory_hostname }}"
+        moid: "{{ vm_moid }}"
         state: present
         snapshot_name: "{{ snapshot_name }}"
         description: "{{ snapshot_desc }}"
@@ -56,6 +67,9 @@
       when: is_powered_on
       register: snapshot_result
 
+    # -------------------------------------------------------------------------
+    # STEP 4: REPORT RESULTS
+    # -------------------------------------------------------------------------
     - name: Report snapshot creation success
       debug:
         msg:
