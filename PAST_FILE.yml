@@ -3,6 +3,7 @@
   hosts: all
   gather_facts: no
   connection: local
+ 
   vars:
     snapshot_name: "Snapshot for patching"
     snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
@@ -12,6 +13,7 @@
     datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
  
   tasks:
+ 
     # -------------------------------------------------------------------------
     # STEP 1: GET VM INFO (INCLUDING MOID)
     # -------------------------------------------------------------------------
@@ -46,13 +48,14 @@
       set_fact:
         vm_moid: "{{ vm_info.instance.moid }}"
         is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
-        vm_storage: "{{ vm_info.instance.hw_disk_total | int }}"   # VM total storage in MB
+        vm_storage_mb: "{{ vm_info.instance.hw_disk_total | int }}"   # VM total storage in MB
  
     - name: Check datastore free space
       set_fact:
         has_enough_space: >-
-          {{ ds_info.datastores | selectattr('name','in', vm_info.instance.hw_datastore)
-             | selectattr('freeSpace','gt', (vm_storage * 1024 * 1024))
+          {{ ds_info.datastores
+             | selectattr('name','in', vm_info.instance.hw_datastore)
+             | selectattr('freeSpace','gt', (vm_storage_mb * 1024 * 1024))
              | list | length > 0 }}
  
     - name: Display pre-flight status
@@ -63,7 +66,7 @@
           - "MOID          : {{ vm_moid }}"
           - "Power State   : {{ vm_info.instance.hw_power_status }}"
           - "Datastore(s)  : {{ vm_info.instance.hw_datastore | join(', ') if vm_info.instance.hw_datastore is defined else 'N/A' }}"
-          - "VM Storage    : {{ vm_storage }} MB"
+          - "VM Storage    : {{ vm_storage_mb }} MB"
           - "Enough Space? : {{ 'YES ✓' if has_enough_space else 'NO ✗ - Insufficient datastore space' }}"
           - "Ready         : {{ 'YES ✓' if is_powered_on and has_enough_space else 'NO ✗' }}"
           - "=========================================="
@@ -85,7 +88,9 @@
         quiesce: no
         memory_dump: no
       delegate_to: localhost
-      when: is_powered_on and has_enough_space
+      when:
+        - is_powered_on
+        - has_enough_space
       register: snapshot_result
  
     # -------------------------------------------------------------------------
