@@ -12,36 +12,10 @@
     vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
     vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
     datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
-    
-    # Timeout settings
-    task_timeout: 60
 
   tasks:
     # -------------------------------------------------------------------------
-    # STEP 0: VERIFY CONNECTIVITY
-    # -------------------------------------------------------------------------
-    - name: Test vCenter connectivity
-      uri:
-        url: "https://{{ vcenter_hostname }}/ui/"
-        method: GET
-        validate_certs: no
-        timeout: 10
-      delegate_to: localhost
-      register: vcenter_test
-      failed_when: false
-      ignore_errors: yes
-
-    - name: Display connectivity status
-      debug:
-        msg: "vCenter connectivity: {{ 'OK' if vcenter_test.status == 200 else 'FAILED - Check hostname/network' }}"
-
-    - name: Fail if vCenter is unreachable
-      fail:
-        msg: "Cannot reach vCenter at {{ vcenter_hostname }}"
-      when: vcenter_test.failed | default(true)
-
-    # -------------------------------------------------------------------------
-    # STEP 1: GET VM BASIC INFO WITH TIMEOUT
+    # STEP 1: GET VM BASIC INFO (NO ASYNC)
     # -------------------------------------------------------------------------
     - name: Get VM information
       community.vmware.vmware_guest_info:
@@ -53,19 +27,12 @@
         name: "{{ inventory_hostname }}"
       delegate_to: localhost
       register: vm_info
-      async: "{{ task_timeout }}"
-      poll: 5
+      ignore_errors: yes
 
-    - name: Check if VM info retrieval succeeded
-      debug:
-        msg: "VM info retrieved successfully for {{ inventory_hostname }}"
-
-    - name: Fail if VM not found
+    - name: Check if VM was found
       fail:
-        msg: "VM {{ inventory_hostname }} not found in datacenter {{ datacenter_name }}"
-      when: 
-        - vm_info.instance is not defined
-        - vm_info.failed | default(false)
+        msg: "Failed to retrieve VM information for {{ inventory_hostname }}"
+      when: vm_info.failed | default(false)
 
     # -------------------------------------------------------------------------
     # STEP 2: EXTRACT VM STORAGE USAGE
@@ -75,113 +42,108 @@
         vm_moid: "{{ vm_info.instance.moid }}"
         is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
         vm_datastore_list: "{{ vm_info.instance.hw_datastore }}"
-        vm_disk_files: "{{ vm_info.instance.hw_files }}"
 
     - name: Calculate VM total storage usage
       set_fact:
-        vm_storage_used_bytes: "{{ vm_disk_files | map(attribute='size') | sum }}"
+        vm_storage_used_bytes: "{{ vm_info.instance.hw_files | map(attribute='size') | sum }}"
 
-    - name: Convert to GB
+    - name: Convert storage to GB
       set_fact:
         vm_storage_used_gb: "{{ (vm_storage_used_bytes | int / 1024 / 1024 / 1024) | round(2) }}"
 
-    - name: Display VM storage info
+    - name: Display initial VM info
       debug:
         msg:
-          - "VM: {{ inventory_hostname }}"
-          - "MOID: {{ vm_moid }}"
-          - "Power: {{ 'ON' if is_powered_on else 'OFF' }}"
-          - "Storage Used: {{ vm_storage_used_gb }} GB"
-          - "Datastores: {{ vm_datastore_list | join(', ') }}"
+          - "=========================================="
+          - "VM INFORMATION"
+          - "=========================================="
+          - "VM Name       : {{ inventory_hostname }}"
+          - "MOID          : {{ vm_moid }}"
+          - "Power State   : {{ 'Powered On' if is_powered_on else 'Powered Off' }}"
+          - "Storage Used  : {{ vm_storage_used_gb }} GB"
+          - "Datastores    : {{ vm_datastore_list | join(', ') }}"
+          - "=========================================="
 
     # -------------------------------------------------------------------------
-    # STEP 3: GET DATASTORE FREE SPACE (ONE AT A TIME)
+    # STEP 3: GET DATASTORE INFO (SEQUENTIAL, NO ASYNC)
     # -------------------------------------------------------------------------
-    - name: Get datastore free space for {{ item }}
-      community.vmware.vmware_datastore_info:
-        hostname: "{{ vcenter_hostname }}"
-        username: "{{ vcenter_username }}"
-        password: "{{ vcenter_password }}"
-        validate_certs: no
-        datacenter: "{{ datacenter_name }}"
-        name: "{{ item }}"
-      delegate_to: localhost
-      register: datastore_info_result
-      loop: "{{ vm_datastore_list }}"
-      async: "{{ task_timeout }}"
-      poll: 5
-      retries: 2
-      delay: 5
-      until: datastore_info_result is succeeded
-
-    # -------------------------------------------------------------------------
-    # STEP 4: BUILD DATASTORE COMPARISON
-    # -------------------------------------------------------------------------
-    - name: Build datastore details
+    - name: Initialize datastore details list
       set_fact:
-        datastore_details: >-
-          {{
-            datastore_details | default([]) + [{
-              'name': item.datastores[0].name,
-              'capacity_gb': (item.datastores[0].capacity / 1024 / 1024 / 1024) | round(2),
-              'free_space_gb': (item.datastores[0].freeSpace / 1024 / 1024 / 1024) | round(2),
-              'free_percent': ((item.datastores[0].freeSpace / item.datastores[0].capacity * 100) | round(2)),
-              'has_sufficient_space': (item.datastores[0].freeSpace / 1024 / 1024 / 1024) > (vm_storage_used_gb | float)
-            }]
-          }}
-      loop: "{{ datastore_info_result.results }}"
-      when: 
-        - item.datastores is defined 
-        - item.datastores | length > 0
-        - not (item.failed | default(false))
+        datastore_details: []
+
+    - name: Get datastore info for each datastore
+      block:
+        - name: Query datastore {{ item }}
+          community.vmware.vmware_datastore_info:
+            hostname: "{{ vcenter_hostname }}"
+            username: "{{ vcenter_username }}"
+            password: "{{ vcenter_password }}"
+            validate_certs: no
+            datacenter: "{{ datacenter_name }}"
+            name: "{{ item }}"
+          delegate_to: localhost
+          register: ds_info
+          ignore_errors: yes
+
+        - name: Add datastore details to list
+          set_fact:
+            datastore_details: >-
+              {{
+                datastore_details + [{
+                  'name': ds_info.datastores[0].name,
+                  'capacity_gb': (ds_info.datastores[0].capacity / 1024 / 1024 / 1024) | round(2),
+                  'free_space_gb': (ds_info.datastores[0].freeSpace / 1024 / 1024 / 1024) | round(2),
+                  'free_percent': ((ds_info.datastores[0].freeSpace / ds_info.datastores[0].capacity * 100) | round(2)),
+                  'has_sufficient_space': (ds_info.datastores[0].freeSpace / 1024 / 1024 / 1024) > (vm_storage_used_gb | float)
+                }]
+              }}
+          when: 
+            - ds_info.datastores is defined
+            - ds_info.datastores | length > 0
+            - not (ds_info.failed | default(false))
+
+        - name: Display datastore query result
+          debug:
+            msg: "Datastore {{ item }}: {{ 'OK' if not (ds_info.failed | default(false)) else 'FAILED' }}"
+
+      loop: "{{ vm_datastore_list }}"
 
     # -------------------------------------------------------------------------
-    # STEP 5: VALIDATE STORAGE CAPACITY
+    # STEP 4: VALIDATE IF SNAPSHOT CAN BE CREATED
     # -------------------------------------------------------------------------
     - name: Check if any datastore has sufficient space
       set_fact:
-        can_create_snapshot: >-
-          {{
-            (datastore_details | default([]) | selectattr('has_sufficient_space', 'equalto', true) | list | length > 0)
-          }}
-        sufficient_datastores: >-
-          {{
-            datastore_details | default([]) | selectattr('has_sufficient_space', 'equalto', true) | list
-          }}
-        insufficient_datastores: >-
-          {{
-            datastore_details | default([]) | selectattr('has_sufficient_space', 'equalto', false) | list
-          }}
+        can_create_snapshot: "{{ (datastore_details | selectattr('has_sufficient_space', 'equalto', true) | list | length > 0) }}"
+        sufficient_datastores: "{{ datastore_details | selectattr('has_sufficient_space', 'equalto', true) | list }}"
+        insufficient_datastores: "{{ datastore_details | selectattr('has_sufficient_space', 'equalto', false) | list }}"
 
     # -------------------------------------------------------------------------
-    # STEP 6: DISPLAY VALIDATION RESULTS
+    # STEP 5: DISPLAY VALIDATION RESULTS
     # -------------------------------------------------------------------------
-    - name: Display storage validation
+    - name: Display storage validation results
       debug:
         msg:
           - "=========================================="
-          - "STORAGE VALIDATION RESULTS"
+          - "DATASTORE CAPACITY ANALYSIS"
           - "=========================================="
-          - "VM                : {{ inventory_hostname }}"
-          - "VM Storage Used   : {{ vm_storage_used_gb }} GB"
-          - "Power State       : {{ 'ON' if is_powered_on else 'OFF' }}"
+          - "VM Storage Used: {{ vm_storage_used_gb }} GB"
           - ""
-          - "DATASTORE ANALYSIS:"
-          - "{% for ds in datastore_details | default([]) %}-----------------------------------
-{{ ds.name }}:
-  Total     : {{ ds.capacity_gb }} GB
+          - "{% for ds in datastore_details %}{{ ds.name }}:
+  Capacity  : {{ ds.capacity_gb }} GB
   Free      : {{ ds.free_space_gb }} GB ({{ ds.free_percent }}%)
-  Status    : {{ 'SUFFICIENT ✓' if ds.has_sufficient_space else 'INSUFFICIENT ✗' }}
-  Reason    : {{ 'Free (' + (ds.free_space_gb | string) + ' GB) > Used (' + (vm_storage_used_gb | string) + ' GB)' if ds.has_sufficient_space else 'Free (' + (ds.free_space_gb | string) + ' GB) < Used (' + (vm_storage_used_gb | string) + ' GB)' }}{% if not loop.last %}
+  Decision  : {{ 'CAN CREATE SNAPSHOT ✓' if ds.has_sufficient_space else 'CANNOT CREATE SNAPSHOT ✗' }}
+  Reason    : Free space {{ 'is greater than' if ds.has_sufficient_space else 'is less than' }} VM usage{% if not loop.last %}
 
 {% endif %}{% endfor %}"
           - "=========================================="
-          - "DECISION          : {{ 'CREATE SNAPSHOT ✓' if (can_create_snapshot and is_powered_on) else 'SKIP SNAPSHOT ✗' }}"
-          - "{% if not is_powered_on %}REASON            : VM is powered off{% elif not can_create_snapshot %}REASON            : No datastore has sufficient free space{% endif %}"
+          - "FINAL DECISION"
+          - "=========================================="
+          - "Create Snapshot: {{ 'YES ✓' if (can_create_snapshot and is_powered_on) else 'NO ✗' }}"
+          - "{% if not is_powered_on %}Reason: VM is powered off{% elif not can_create_snapshot %}Reason: No datastore has free space > {{ vm_storage_used_gb }} GB{% else %}Reason: At least one datastore has sufficient space{% endif %}"
           - "=========================================="
 
     # -------------------------------------------------------------------------
-    # STEP 7: CREATE SNAPSHOT IF VALIDATION PASSES
+    # STEP 6: CREATE SNAPSHOT (IF VALIDATION PASSES)
     # -------------------------------------------------------------------------
     - name: Create VM snapshot
       community.vmware.vmware_guest_snapshot:
@@ -201,64 +163,66 @@
         - is_powered_on
         - can_create_snapshot | bool
       register: snapshot_result
-      async: 300
-      poll: 10
+      ignore_errors: yes
 
     # -------------------------------------------------------------------------
-    # STEP 8: REPORT RESULTS
+    # STEP 7: REPORT RESULTS
     # -------------------------------------------------------------------------
-    - name: Report SUCCESS
+    - name: Report snapshot creation SUCCESS
       debug:
         msg:
           - "=========================================="
-          - "✓✓✓ SNAPSHOT CREATED ✓✓✓"
+          - "✓✓✓ SNAPSHOT CREATED SUCCESSFULLY ✓✓✓"
           - "=========================================="
           - "VM            : {{ inventory_hostname }}"
           - "Snapshot      : {{ snapshot_name }}"
           - "Storage Used  : {{ vm_storage_used_gb }} GB"
           - ""
-          - "Datastores with sufficient space:"
+          - "Sufficient datastores:"
           - "{% for ds in sufficient_datastores %}  ✓ {{ ds.name }}: {{ ds.free_space_gb }} GB free{% if not loop.last %}
 {% endif %}{% endfor %}"
           - "=========================================="
       when:
         - snapshot_result is defined
         - snapshot_result.changed | default(false)
+        - not (snapshot_result.failed | default(false))
 
-    - name: Report SKIPPED - Insufficient Storage
+    - name: Report SKIPPED due to insufficient storage
       debug:
         msg:
           - "=========================================="
-          - "⊘ SKIPPED - INSUFFICIENT STORAGE"
+          - "⊘ SNAPSHOT SKIPPED - INSUFFICIENT STORAGE"
           - "=========================================="
           - "VM            : {{ inventory_hostname }}"
           - "Storage Used  : {{ vm_storage_used_gb }} GB"
           - ""
-          - "{% for ds in insufficient_datastores | default([]) %}  ✗ {{ ds.name }}: {{ ds.free_space_gb }} GB free (need > {{ vm_storage_used_gb }} GB){% if not loop.last %}
+          - "All datastores have insufficient free space:"
+          - "{% for ds in datastore_details %}  ✗ {{ ds.name }}: {{ ds.free_space_gb }} GB free (need > {{ vm_storage_used_gb }} GB){% if not loop.last %}
 {% endif %}{% endfor %}"
           - "=========================================="
       when:
         - is_powered_on
         - not (can_create_snapshot | bool)
 
-    - name: Report SKIPPED - VM Powered Off
+    - name: Report SKIPPED due to VM powered off
       debug:
         msg:
           - "=========================================="
-          - "⊘ SKIPPED - VM POWERED OFF"
+          - "⊘ SNAPSHOT SKIPPED - VM POWERED OFF"
           - "=========================================="
           - "VM            : {{ inventory_hostname }}"
+          - "Power State   : Powered Off"
           - "=========================================="
       when: not is_powered_on
 
-    - name: Report FAILED
+    - name: Report snapshot creation FAILURE
       debug:
         msg:
           - "=========================================="
-          - "✗ SNAPSHOT CREATION FAILED"
+          - "✗✗✗ SNAPSHOT CREATION FAILED ✗✗✗"
           - "=========================================="
           - "VM            : {{ inventory_hostname }}"
-          - "Error         : {{ snapshot_result.msg | default('Unknown error') }}"
+          - "Error Message : {{ snapshot_result.msg | default('Unknown error') }}"
           - "=========================================="
       when:
         - snapshot_result is defined
