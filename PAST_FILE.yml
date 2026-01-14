@@ -1,380 +1,136 @@
 ---
-
 - name: VMware Snapshot Creation - OPTIMAL SOLUTION
-
   hosts: all
-
   gather_facts: no
-
   connection: local
-
+ 
   vars:
-
     snapshot_name: "Snapshot for patching"
-
     snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
-
     vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
-
     vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
-
     vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
-
     datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
-
+ 
   tasks:
-
+ 
     # -------------------------------------------------------------------------
-
     # STEP 1: GET VM INFO (INCLUDING MOID)
-
     # -------------------------------------------------------------------------
-
     - name: Get VM information
-
       community.vmware.vmware_guest_info:
-
         hostname: "{{ vcenter_hostname }}"
-
         username: "{{ vcenter_username }}"
-
         password: "{{ vcenter_password }}"
-
         validate_certs: no
-
         datacenter: "{{ datacenter_name }}"
-
         name: "{{ inventory_hostname }}"
-
       delegate_to: localhost
-
       register: vm_info
-
+ 
     # -------------------------------------------------------------------------
-
     # STEP 2: GET DATASTORE INFO
-
     # -------------------------------------------------------------------------
-
     - name: Get datastore information
-
       community.vmware.vmware_datastore_info:
-
         hostname: "{{ vcenter_hostname }}"
-
         username: "{{ vcenter_username }}"
-
         password: "{{ vcenter_password }}"
-
         validate_certs: no
-
         datacenter: "{{ datacenter_name }}"
-
       delegate_to: localhost
-
       register: ds_info
-
+ 
     # -------------------------------------------------------------------------
-
-    # STEP 3: EXTRACT VM + DATASTORE FACTS (CORRECTED)
-
+    # STEP 3: EXTRACT VM + DATASTORE FACTS
     # -------------------------------------------------------------------------
-
     - name: Set VM facts
-
       set_fact:
-
         vm_moid: "{{ vm_info.instance.moid }}"
-
         is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
-
-        # Calculate total VM disk size in bytes from all disks
-
         vm_storage_bytes: "{{ vm_info.instance.hw_files | map(attribute='size') | sum }}"
+        vm_datastore_name: "{{ vm_info.instance.hw_datastore[0] }}"
  
     - name: Calculate VM storage in GB for display
-
       set_fact:
-
         vm_storage_gb: "{{ (vm_storage_bytes | int / 1024 / 1024 / 1024) | round(2) }}"
  
-    - name: Get VM's datastore and check free space
-
+    - name: Get datastore free space
       set_fact:
-
-        vm_datastore_name: "{{ vm_info.instance.hw_datastore[0] }}"
-
         datastore_free_bytes: >-
-
-          {{ (ds_info.datastores 
-
-              | selectattr('name', 'equalto', vm_info.instance.hw_datastore[0]) 
-
+          {{ (ds_info.datastores
+              | selectattr('name', 'equalto', vm_info.instance.hw_datastore[0])
               | first).freeSpace }}
  
     - name: Determine if datastore has enough space
-
       set_fact:
-
         has_enough_space: "{{ datastore_free_bytes | int > vm_storage_bytes | int }}"
  
     - name: Display pre-flight status
-
       debug:
-
         msg:
-
           - "=========================================="
-
           - "VM            : {{ inventory_hostname }}"
-
           - "MOID          : {{ vm_moid }}"
-
           - "Power State   : {{ vm_info.instance.hw_power_status }}"
-
           - "Datastore     : {{ vm_datastore_name }}"
-
           - "VM Storage    : {{ vm_storage_gb }} GB"
-
           - "Datastore Free: {{ (datastore_free_bytes | int / 1024 / 1024 / 1024) | round(2) }} GB"
-
           - "Enough Space? : {{ 'YES ✓' if has_enough_space else 'NO ✗ - Insufficient datastore space' }}"
-
           - "Ready         : {{ 'YES ✓' if is_powered_on and has_enough_space else 'NO ✗' }}"
-
           - "=========================================="
-
+ 
     # -------------------------------------------------------------------------
-
     # STEP 4: CREATE SNAPSHOT ONLY IF POWERED ON + ENOUGH SPACE
-
     # -------------------------------------------------------------------------
-
     - name: Create VM snapshot using MOID
-
       community.vmware.vmware_guest_snapshot:
-
         hostname: "{{ vcenter_hostname }}"
-
         username: "{{ vcenter_username }}"
-
         password: "{{ vcenter_password }}"
-
         validate_certs: no
-
         datacenter: "{{ datacenter_name }}"
-
         moid: "{{ vm_moid }}"
-
         state: present
-
         snapshot_name: "{{ snapshot_name }}"
-
         description: "{{ snapshot_desc }}"
-
         quiesce: no
-
         memory_dump: no
-
       delegate_to: localhost
-
       when:
-
         - is_powered_on
-
         - has_enough_space
-
       register: snapshot_result
-
+ 
     # -------------------------------------------------------------------------
-
-    # STEP 5: REPORT RESULTS WITH DETAILED FAILURE REASONS
-
+    # STEP 5: REPORT RESULTS (SINGLE CONSOLIDATED BLOCK)
     # -------------------------------------------------------------------------
-
-    - name: Report snapshot creation success
-
-      debug:
-
-        msg:
-
-          - "=========================================="
-
-          - "✓ SUCCESS - SNAPSHOT CREATED"
-
-          - "=========================================="
-
-          - "VM Name       : {{ inventory_hostname }}"
-
-          - "Snapshot Name : {{ snapshot_name }}"
-
-          - "Power State   : {{ vm_info.instance.hw_power_status }}"
-
-          - "VM Size       : {{ vm_storage_gb }} GB"
-
-          - "Datastore     : {{ vm_datastore_name }}"
-
-          - "Free Space    : {{ (datastore_free_bytes | int / 1024 / 1024 / 1024) | round(2) }} GB"
-
-          - "=========================================="
-
-      when:
-
-        - snapshot_result is defined
-
-        - snapshot_result.changed
-
-    - name: Report snapshot creation failure (API/vCenter error)
-
-      debug:
-
-        msg:
-
-          - "=========================================="
-
-          - "✗ FAILED - SNAPSHOT CREATION ERROR"
-
-          - "=========================================="
-
-          - "VM Name       : {{ inventory_hostname }}"
-
-          - "Snapshot Name : {{ snapshot_name }}"
-
-          - "Failure Reason: vCenter API returned an error"
-
-          - "Error Details : {{ snapshot_result.msg | default('Unknown error') }}"
-
-          - "=========================================="
-
-          - "ACTION REQUIRED: Check vCenter logs or VMware permissions"
-
-          - "=========================================="
-
-      when:
-
-        - snapshot_result is defined
-
-        - snapshot_result.failed | default(false)
-
-    - name: Report skipped - VM powered off
-
-      debug:
-
-        msg:
-
-          - "=========================================="
-
-          - "⊘ SKIPPED - VM IS POWERED OFF"
-
-          - "=========================================="
-
-          - "VM Name       : {{ inventory_hostname }}"
-
-          - "Power State   : {{ vm_info.instance.hw_power_status }}"
-
-          - "Failure Reason: Cannot create snapshot on powered off VM"
-
-          - "VM Size       : {{ vm_storage_gb }} GB"
-
-          - "Datastore     : {{ vm_datastore_name }}"
-
-          - "Free Space    : {{ (datastore_free_bytes | int / 1024 / 1024 / 1024) | round(2) }} GB"
-
-          - "=========================================="
-
-          - "ACTION REQUIRED: Power on the VM before creating snapshot"
-
-          - "=========================================="
-
-      when:
-
-        - not is_powered_on
-
-        - has_enough_space
+    - name: Set snapshot status message
+      set_fact:
+        snapshot_status: >-
+          {% if snapshot_result is defined and snapshot_result.changed %}
+          ✓ SUCCESS - Snapshot '{{ snapshot_name }}' created for {{ inventory_hostname }}
+          {% elif snapshot_result is defined and snapshot_result.failed | default(false) %}
+          ✗ FAILED - Could not create snapshot for {{ inventory_hostname }}
+          Error: {{ snapshot_result.msg | default('Unknown error') }}
+          {% elif not is_powered_on and not has_enough_space %}
+          ⊘ SKIPPED - VM powered off AND insufficient datastore space
+          {% elif not is_powered_on %}
+          ⊘ SKIPPED - VM powered off
+          {% elif not has_enough_space %}
+          ⊘ SKIPPED - Insufficient datastore space
+          {% else %}
+          ⊘ SKIPPED - Unknown condition
+          {% endif %}
  
-    - name: Report skipped - Insufficient datastore space
-
+    - name: Report snapshot status
       debug:
-
         msg:
-
           - "=========================================="
-
-          - "⊘ SKIPPED - INSUFFICIENT DATASTORE SPACE"
-
-          - "=========================================="
-
+          - "{{ snapshot_status }}"
           - "VM Name       : {{ inventory_hostname }}"
-
           - "Power State   : {{ vm_info.instance.hw_power_status }}"
-
-          - "Failure Reason: Datastore does not have enough free space"
-
           - "VM Size       : {{ vm_storage_gb }} GB"
-
           - "Datastore     : {{ vm_datastore_name }}"
-
           - "Free Space    : {{ (datastore_free_bytes | int / 1024 / 1024 / 1024) | round(2) }} GB"
-
-          - "Space Needed  : {{ vm_storage_gb }} GB (minimum)"
-
-          - "Space Deficit : {{ (vm_storage_gb | float - (datastore_free_bytes | int / 1024 / 1024 / 1024)) | round(2) }} GB short"
-
           - "=========================================="
-
-          - "ACTION REQUIRED: Free up space on {{ vm_datastore_name }} or migrate VM to larger datastore"
-
-          - "=========================================="
-
-      when:
-
-        - is_powered_on
-
-        - not has_enough_space
- 
-    - name: Report skipped - Both conditions failed
-
-      debug:
-
-        msg:
-
-          - "=========================================="
-
-          - "⊘ SKIPPED - MULTIPLE ISSUES DETECTED"
-
-          - "=========================================="
-
-          - "VM Name       : {{ inventory_hostname }}"
-
-          - "Power State   : {{ vm_info.instance.hw_power_status }}"
-
-          - "Failure Reasons:"
-
-          - "  1. VM is powered off"
-
-          - "  2. Insufficient datastore space"
-
-          - "VM Size       : {{ vm_storage_gb }} GB"
-
-          - "Datastore     : {{ vm_datastore_name }}"
-
-          - "Free Space    : {{ (datastore_free_bytes | int / 1024 / 1024 / 1024) | round(2) }} GB"
-
-          - "Space Deficit : {{ (vm_storage_gb | float - (datastore_free_bytes | int / 1024 / 1024 / 1024)) | round(2) }} GB short"
-
-          - "=========================================="
-
-          - "ACTION REQUIRED:"
-
-          - "  1. Power on the VM"
-
-          - "  2. Free up space on {{ vm_datastore_name }} or migrate VM"
-
-          - "=========================================="
-
-      when:
-
-        - not is_powered_on
-
-        - not has_enough_space
- 
