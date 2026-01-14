@@ -90,27 +90,37 @@
       set_fact:
         has_storage_info: "{{ vm_info.instance.storage is defined and vm_info.instance.storage.perDatastoreUsage is defined }}"
 
-    - name: Extract VM storage per datastore information
+    - name: Extract VM storage information
       set_fact:
         vm_storage_per_ds: "{{ vm_info.instance.storage.perDatastoreUsage | default([]) }}"
         vm_datastore_names: "{{ vm_info.instance.config.datastoreUrl | map(attribute='name') | list }}"
+        vm_datastore_refs: "{{ vm_info.instance.datastore }}"
+        vm_total_committed_bytes: "{{ vm_info.instance.storage.perDatastoreUsage | map(attribute='committed') | sum }}"
+      when: has_storage_info
+
+    - name: Calculate total VM storage
+      set_fact:
+        vm_total_committed_gb: "{{ (vm_total_committed_bytes | int / 1073741824) | round(2) }}"
       when: has_storage_info
 
     - name: Use fallback if storage info unavailable
       set_fact:
         vm_storage_per_ds: []
         vm_datastore_names: []
+        vm_datastore_refs: []
+        vm_total_committed_gb: 0
         skip_space_check: true
       when: not has_storage_info
 
-    - name: Display VM storage info
+    - name: Display VM total storage
       debug:
         msg: 
+          - "VM Total Committed Storage: {{ vm_total_committed_gb }} GB"
           - "VM uses {{ vm_storage_per_ds | length }} datastore(s)"
           - "Datastores: {{ vm_datastore_names | join(', ') }}"
 
     # -------------------------------------------------------------------------
-    # STEP 5: GET DATASTORE DETAILS (ONLY FOR VM'S DATASTORES)
+    # STEP 5: GET DATASTORE DETAILS
     # -------------------------------------------------------------------------
     - name: Get all datastores in datacenter
       community.vmware.vmware_datastore_info:
@@ -129,7 +139,7 @@
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # -------------------------------------------------------------------------
-    # STEP 6: BUILD DATASTORE REFERENCE MAPPING
+    # STEP 6: BUILD DATASTORE MAPPING
     # -------------------------------------------------------------------------
     - name: Build datastore mapping for VM's datastores only
       block:
@@ -156,32 +166,10 @@
           loop_control:
             label: "{{ item.name }}"
 
-        - name: Create mapping from datastore vim reference to name
-          set_fact:
-            ds_vim_to_name: {}
-
-        - name: Build vim reference to name mapping
-          set_fact:
-            ds_vim_to_name: >-
-              {{
-                ds_vim_to_name | combine({
-                  ('vim.Datastore:' + item): (vm_info.instance.config.datastoreUrl | selectattr('name', 'defined') | list | selectattr('url', 'search', all_datastores_info.datastores | selectattr('name', 'equalto', (vm_info.instance.config.datastoreUrl | selectattr('name', 'equalto', item) | map(attribute='name') | first)) | map(attribute='url') | first | default('')) | map(attribute='name') | first | default(item))
-                })
-              }}
-          loop: "{{ vm_datastore_names }}"
-          loop_control:
-            label: "{{ item }}"
-          when: false  # Skip this complex approach
-
-        - name: Create simpler datastore index mapping
-          set_fact:
-            ds_name_list: "{{ vm_info.instance.config.datastoreUrl | map(attribute='name') | list }}"
-            ds_vim_list: "{{ vm_info.instance.datastore }}"
-
       when: skip_space_check is not defined and vm_datastore_names | length > 0
 
     # -------------------------------------------------------------------------
-    # STEP 7: ANALYZE DATASTORE SPACE
+    # STEP 7: ANALYZE DATASTORE SPACE WITH ACTUAL VM STORAGE
     # -------------------------------------------------------------------------
     - name: Analyze datastore space availability
       block:
@@ -194,21 +182,12 @@
             datastore_checks: >-
               {{
                 datastore_checks + [{
-                  'name': ds_name_list[idx],
-                  'vim_ref': ds_vim_list[idx],
+                  'name': vm_datastore_names[idx],
+                  'vim_ref': vm_datastore_refs[idx],
                   'vm_committed_gb': (
                     vm_storage_per_ds
-                    | selectattr('datastore', 'equalto', ds_vim_list[idx])
+                    | selectattr('datastore', 'equalto', vm_datastore_refs[idx])
                     | map(attribute='committed')
-                    | list
-                    | first
-                    | default(0)
-                    / 1073741824
-                  ) | round(2),
-                  'vm_uncommitted_gb': (
-                    vm_storage_per_ds
-                    | selectattr('datastore', 'equalto', ds_vim_list[idx])
-                    | map(attribute='uncommitted')
                     | list
                     | first
                     | default(0)
@@ -217,7 +196,7 @@
                   'required_space_gb': (
                     (
                       vm_storage_per_ds
-                      | selectattr('datastore', 'equalto', ds_vim_list[idx])
+                      | selectattr('datastore', 'equalto', vm_datastore_refs[idx])
                       | map(attribute='committed')
                       | list
                       | first
@@ -225,15 +204,15 @@
                       / 1073741824
                     ) + safety_margin_gb
                   ) | round(2),
-                  'ds_free_gb': ds_name_to_details[ds_name_list[idx]]['free_gb'],
-                  'ds_capacity_gb': ds_name_to_details[ds_name_list[idx]]['capacity_gb'],
+                  'ds_free_gb': ds_name_to_details[vm_datastore_names[idx]]['free_gb'],
+                  'ds_capacity_gb': ds_name_to_details[vm_datastore_names[idx]]['capacity_gb'],
                   'has_space': (
-                    ds_name_to_details[ds_name_list[idx]]['free_gb'] | float
+                    ds_name_to_details[vm_datastore_names[idx]]['free_gb'] | float
                   ) >= (
                     (
                       (
                         vm_storage_per_ds
-                        | selectattr('datastore', 'equalto', ds_vim_list[idx])
+                        | selectattr('datastore', 'equalto', vm_datastore_refs[idx])
                         | map(attribute='committed')
                         | list
                         | first
@@ -244,10 +223,10 @@
                   )
                 }]
               }}
-          loop: "{{ range(0, ds_name_list | length) | list }}"
+          loop: "{{ range(0, vm_datastore_names | length) | list }}"
           loop_control:
             loop_var: idx
-            label: "{{ ds_name_list[idx] }}"
+            label: "{{ vm_datastore_names[idx] }}"
 
         - name: Display datastore space analysis
           debug:
@@ -255,15 +234,16 @@
               ==========================================
               Datastore Space Analysis for {{ vm_name }}
               ==========================================
+              VM Total Committed Storage: {{ vm_total_committed_gb }} GB
+              Safety Margin: {{ safety_margin_gb }} GB
+              ---
               {% for ds in datastore_checks %}
               Datastore: {{ ds.name }}
-                VIM Reference  : {{ ds.vim_ref }}
-                VM Committed   : {{ ds.vm_committed_gb }} GB
-                VM Uncommitted : {{ ds.vm_uncommitted_gb }} GB
-                Required Space : {{ ds.required_space_gb }} GB (committed + {{ safety_margin_gb }} GB margin)
-                DS Capacity    : {{ ds.ds_capacity_gb }} GB
-                DS Free Space  : {{ ds.ds_free_gb }} GB
-                Status         : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT' }}
+                VM Storage on this DS : {{ ds.vm_committed_gb }} GB
+                Required for Snapshot : {{ ds.required_space_gb }} GB (storage + margin)
+                DS Free Space         : {{ ds.ds_free_gb }} GB
+                DS Capacity           : {{ ds.ds_capacity_gb }} GB
+                Status                : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT - SNAPSHOT WILL BE SKIPPED' }}
               ---
               {% endfor %}
               ==========================================
@@ -277,15 +257,21 @@
             - debug:
                 msg: |
                   ==========================================
-                  ⊘ SKIPPED: Insufficient space on datastore(s)
+                  ⊘ SNAPSHOT CREATION SKIPPED
+                  ==========================================
                   VM: {{ vm_name }}
-                  ---
+                  Reason: Insufficient free space on one or more datastores
+                  
+                  VM Total Storage: {{ vm_total_committed_gb }} GB
+                  
+                  Datastores with insufficient space:
                   {% for ds in insufficient_datastores %}
+                  
                   {{ ds.name }}:
-                    VM Committed : {{ ds.vm_committed_gb }} GB
-                    Required     : {{ ds.required_space_gb }} GB
-                    Available    : {{ ds.ds_free_gb }} GB
-                    Shortage     : {{ (ds.required_space_gb - ds.ds_free_gb) | round(2) }} GB
+                    VM Storage        : {{ ds.vm_committed_gb }} GB
+                    Required Space    : {{ ds.required_space_gb }} GB
+                    Available Space   : {{ ds.ds_free_gb }} GB
+                    Shortage          : {{ (ds.required_space_gb - ds.ds_free_gb) | round(2) }} GB
                   {% endfor %}
                   ==========================================
             - meta: end_host
@@ -293,9 +279,15 @@
 
         - name: All datastores have sufficient space
           debug:
-            msg:
-              - "✓ All {{ datastore_checks | length }} datastore(s) have sufficient space"
-              - "Proceeding with snapshot creation..."
+            msg: |
+              ==========================================
+              ✓ SPACE CHECK PASSED
+              ==========================================
+              VM: {{ vm_name }}
+              Total VM Storage: {{ vm_total_committed_gb }} GB
+              All {{ datastore_checks | length }} datastore(s) have sufficient free space
+              Proceeding with snapshot creation...
+              ==========================================
 
       when: skip_space_check is not defined and vm_datastore_names | length > 0
 
@@ -331,9 +323,11 @@
       debug:
         msg:
           - "=========================================="
-          - "✓ SUCCESS"
+          - "✓ SNAPSHOT CREATED SUCCESSFULLY"
+          - "=========================================="
           - "VM: {{ vm_name }}"
-          - "Snapshot: '{{ snapshot_name }}' created"
+          - "Snapshot Name: {{ snapshot_name }}"
+          - "VM Total Storage: {{ vm_total_committed_gb }} GB"
           - "=========================================="
       when:
         - snapshot_result is defined
@@ -344,7 +338,8 @@
       debug:
         msg:
           - "=========================================="
-          - "✗ FAILED"
+          - "✗ SNAPSHOT CREATION FAILED"
+          - "=========================================="
           - "VM: {{ vm_name }}"
           - "Error: {{ snapshot_result.msg | default('Snapshot creation failed') }}"
           - "=========================================="
@@ -357,8 +352,9 @@
         msg:
           - "=========================================="
           - "⊘ NO CHANGE"
+          - "=========================================="
           - "VM: {{ vm_name }}"
-          - "Snapshot may already exist"
+          - "Snapshot may already exist or no changes were made"
           - "=========================================="
       when:
         - snapshot_result is defined
