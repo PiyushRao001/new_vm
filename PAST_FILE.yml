@@ -1,0 +1,234 @@
+---
+- name: Production VM Snapshot Safety
+  hosts: all
+  gather_facts: no
+  connection: local
+
+  vars:
+    snapshot_name: "Snapshot for patching"
+    snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
+
+    vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
+    vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
+    vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
+    datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
+    vm_folder: "{{ lookup('env', 'VCENTER_VM_FOLDER') }}"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # STEP 1: VM FACTS
+    # -------------------------------------------------------------------------
+    - name: Fetch VM Facts
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        name: "{{ inventory_hostname }}"
+        schema: vsphere
+        properties:
+          - summary.storage
+          - summary.runtime
+          - datastore
+      delegate_to: localhost
+      register: vm_facts
+
+    # -------------------------------------------------------------------------
+    # STEP 2: CHECK EXISTING SNAPSHOTS
+    # -------------------------------------------------------------------------
+    - name: Check for existing snapshots
+      community.vmware.vmware_guest_snapshot_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        name: "{{ inventory_hostname }}"
+        folder: "{{ vm_folder }}"
+      delegate_to: localhost
+      register: snapshot_info
+      ignore_errors: yes
+
+    - name: Check if snapshot already exists
+      set_fact:
+        snapshot_exists: >-
+          {{
+            snapshot_info.guest_snapshots.snapshots is defined and
+            snapshot_info.guest_snapshots.snapshots | 
+            selectattr('name', 'equalto', snapshot_name) | 
+            list | length > 0
+          }}
+
+    - name: Report snapshot already exists
+      debug:
+        msg: "Snapshot '{{ snapshot_name }}' already exists for {{ inventory_hostname }}. Skipping creation."
+      when: snapshot_exists
+
+    # -------------------------------------------------------------------------
+    # STEP 3: DATASTORE FACTS
+    # -------------------------------------------------------------------------
+    - name: Fetch Datastore Details
+      community.vmware.vmware_datastore_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+      delegate_to: localhost
+      register: all_datastores
+      when: not snapshot_exists
+
+    # -------------------------------------------------------------------------
+    # STEP 4: VM DISK INFO
+    # -------------------------------------------------------------------------
+    - name: Fetch VM Disk Information
+      community.vmware.vmware_guest_disk_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        name: "{{ inventory_hostname }}"
+      delegate_to: localhost
+      register: vm_disks
+      when: not snapshot_exists
+
+    # -------------------------------------------------------------------------
+    # STEP 5: CALCULATIONS & VALIDATION
+    # -------------------------------------------------------------------------
+    - name: Extract VM Datastore Names
+      set_fact:
+        vm_datastore_names: >-
+          {% if vm_facts.instance.datastore[0] is string %}
+            {{ vm_facts.instance.datastore }}
+          {% else %}
+            {{ vm_facts.instance.datastore | map(attribute='name') | list }}
+          {% endif %}
+      when: not snapshot_exists
+
+    - name: Build committed size per datastore
+      set_fact:
+        ds_committed_map: >-
+          {{
+            ds_committed_map | default({}) |
+            combine({
+              item.backing_datastore:
+                (ds_committed_map[item.backing_datastore] | default(0))
+                + (item.capacity_in_bytes | int)
+            })
+          }}
+      loop: "{{ vm_disks.guest_disk_info.values() | list }}"
+      when: 
+        - not snapshot_exists
+        - vm_disks.guest_disk_info is defined
+
+    - name: Filter VM-attached datastores
+      set_fact:
+        vm_datastores: >-
+          {{
+            all_datastores.datastores
+            | selectattr('name', 'in', vm_datastore_names)
+            | list
+          }}
+      when: not snapshot_exists
+
+    - name: Validate per-datastore free space (storage must be less than free space)
+      set_fact:
+        ds_space_check: >-
+          {{
+            ds_space_check | default({}) |
+            combine({
+              item.name:
+                (
+                  item.freeSpace | int >
+                  (ds_committed_map[item.name] | default(0))
+                )
+            })
+          }}
+      loop: "{{ vm_datastores }}"
+      when: not snapshot_exists
+
+    - name: Check if ALL datastores have sufficient space
+      set_fact:
+        all_datastores_ok: >-
+          {{
+            ds_space_check.values() | list | select('equalto', false) | list | length == 0
+          }}
+      when: 
+        - not snapshot_exists
+        - ds_space_check is defined
+
+    - name: Final power & space decision
+      set_fact:
+        check_space: "{{ all_datastores_ok | default(false) }}"
+        check_power: "{{ vm_facts.instance.summary.runtime.powerState == 'poweredOn' }}"
+      when: not snapshot_exists
+
+    # -------------------------------------------------------------------------
+    # STEP 6: REPORTING
+    # -------------------------------------------------------------------------
+    - name: Datastore Space Report
+      debug:
+        msg:
+          - "Datastore : {{ item.key }}"
+          - "VM Usage  : {{ (ds_committed_map[item.key] | default(0) / 1073741824) | round(2) }} GB"
+          - "Free Space: {{ ((vm_datastores | selectattr('name','equalto',item.key) | first).freeSpace / 1073741824) | round(2) }} GB"
+          - "Status    : {{ 'PASS (Free Space > VM Usage)' if item.value else 'FAIL - INSUFFICIENT SPACE' }}"
+      loop: "{{ ds_space_check | dict2items }}"
+      when: 
+        - not snapshot_exists
+        - ds_space_check is defined
+
+    - name: Pre-flight summary
+      debug:
+        msg:
+          - "=========================================="
+          - "HOST   : {{ inventory_hostname }}"
+          - "POWER  : {{ 'PASS (powered on)' if check_power else 'FAIL (powered off)' }}"
+          - "SPACE  : {{ 'PASS (all datastores OK)' if check_space else 'FAIL (insufficient space on one or more datastores)' }}"
+          - "SNAPSHOT EXISTS: {{ 'YES - SKIPPING' if snapshot_exists else 'NO' }}"
+          - "ACTION : {{ 'TAKING SNAPSHOT' if (check_power and check_space and not snapshot_exists) else 'SKIPPING' }}"
+          - "=========================================="
+      when: not snapshot_exists
+
+    # -------------------------------------------------------------------------
+    # STEP 7: SNAPSHOT EXECUTION
+    # -------------------------------------------------------------------------
+    - name: Create Snapshot
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        name: "{{ inventory_hostname }}"
+        state: present
+        snapshot_name: "{{ snapshot_name }}"
+        description: "{{ snapshot_desc }}"
+        quiesce: no
+        memory_dump: no
+      delegate_to: localhost
+      when:
+        - not snapshot_exists
+        - check_power | default(false)
+        - check_space | default(false)
+      register: snapshot_result
+
+    - name: Snapshot success confirmation
+      debug:
+        msg: "✓ Snapshot created successfully for {{ inventory_hostname }}"
+      when: 
+        - snapshot_result is defined
+        - snapshot_result is changed
+
+    - name: Final Status Summary
+      debug:
+        msg:
+          - "=========================================="
+          - "FINAL STATUS for {{ inventory_hostname }}"
+          - "{{ 'Snapshot already existed - no action taken' if snapshot_exists else '' }}"
+          - "{{ 'New snapshot created successfully' if (snapshot_result is defined and snapshot_result is changed) else '' }}"
+          - "{{ 'Snapshot skipped - VM powered off' if (not snapshot_exists and not check_power | default(false)) else '' }}"
+          - "{{ 'Snapshot skipped - insufficient datastore space' if (not snapshot_exists and not check_space | default(false)) else '' }}"
+          - "=========================================="
