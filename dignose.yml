@@ -35,9 +35,6 @@
       set_fact:
         vm_moid: "{{ vm_info.instance.moid }}"
         is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
-        vm_storage_used_bytes: "{{ vm_info.instance.hw_folder_hs | default({}) | json_query('summary.storage.committed') | default(0) | int }}"
-        vm_storage_used_gb: "{{ ((vm_info.instance.hw_folder_hs | default({}) | json_query('summary.storage.committed') | default(0) | int) / 1024 / 1024 / 1024) | round(2) }}"
-        vm_storage_used_tb: "{{ ((vm_info.instance.hw_folder_hs | default({}) | json_query('summary.storage.committed') | default(0) | int) / 1024 / 1024 / 1024 / 1024) | round(2) }}"
 
     - name: Display pre-flight status
       debug:
@@ -47,126 +44,11 @@
           - "MOID          : {{ vm_moid }}"
           - "Power State   : {{ vm_info.instance.hw_power_status }}"
           - "Datastore(s)  : {{ vm_info.instance.hw_datastore | join(', ') if vm_info.instance.hw_datastore is defined else 'N/A' }}"
-          - "Storage Used  : {{ vm_storage_used_gb }} GB ({{ vm_storage_used_tb }} TB)"
           - "Ready         : {{ 'YES ✓' if is_powered_on else 'NO ✗ - VM is powered off' }}"
           - "=========================================="
 
     # -------------------------------------------------------------------------
-    # STEP 3: CHECK IF SNAPSHOTS ALREADY EXIST
-    # -------------------------------------------------------------------------
-    - name: Get existing snapshots
-      community.vmware.vmware_guest_snapshot_info:
-        hostname: "{{ vcenter_hostname }}"
-        username: "{{ vcenter_username }}"
-        password: "{{ vcenter_password }}"
-        validate_certs: no
-        datacenter: "{{ datacenter_name }}"
-        moid: "{{ vm_moid }}"
-      delegate_to: localhost
-      register: snapshot_info
-      when: is_powered_on
-
-    - name: Check if snapshots exist
-      set_fact:
-        has_existing_snapshots: "{{ snapshot_info.guest_snapshots.snapshots | default([]) | length > 0 }}"
-      when: is_powered_on
-
-    - name: Report existing snapshots found
-      debug:
-        msg:
-          - "=========================================="
-          - "⊘ SKIPPED - Snapshot already exists"
-          - "{{ inventory_hostname }} has {{ snapshot_info.guest_snapshots.snapshots | length }} snapshot(s)"
-          - "Existing snapshots:"
-          - "{{ snapshot_info.guest_snapshots.snapshots | map(attribute='name') | list }}"
-          - "=========================================="
-      when:
-        - is_powered_on
-        - has_existing_snapshots | default(false)
-
-    # -------------------------------------------------------------------------
-    # STEP 4: GET DATASTORE INFORMATION FOR ALL VM DATASTORES
-    # -------------------------------------------------------------------------
-    - name: Get datastore info for all VM datastores
-      community.vmware.vmware_datastore_info:
-        hostname: "{{ vcenter_hostname }}"
-        username: "{{ vcenter_username }}"
-        password: "{{ vcenter_password }}"
-        validate_certs: no
-        datacenter: "{{ datacenter_name }}"
-      delegate_to: localhost
-      register: datastore_info_all
-      when:
-        - is_powered_on
-        - not (has_existing_snapshots | default(false))
-    
-    - name: Filter datastores for this VM only
-      set_fact:
-        datastore_info_results: "{{ {'results': [{'datastores': datastore_info_all.datastores | selectattr('name', 'in', vm_info.instance.hw_datastore) | list}]} }}"
-      when:
-        - is_powered_on
-        - not (has_existing_snapshots | default(false))
-        - datastore_info_all is defined
-
-    # -------------------------------------------------------------------------
-    # STEP 5: CHECK FREE SPACE ON ALL DATASTORES
-    # -------------------------------------------------------------------------
-    - name: Check if any datastore has sufficient free space
-      set_fact:
-        sufficient_space: >-
-          {{
-            datastore_info_results.results | default([])
-            | selectattr('datastores', 'defined')
-            | map(attribute='datastores')
-            | flatten
-            | selectattr('freeSpace', 'defined')
-            | map(attribute='freeSpace')
-            | map('int')
-            | select('>', vm_storage_used_bytes | int)
-            | list
-            | length > 0
-          }}
-      when:
-        - is_powered_on
-        - not (has_existing_snapshots | default(false))
-        - datastore_info_results is defined
-
-    - name: Display datastore space details
-      debug:
-        msg:
-          - "=========================================="
-          - "DATASTORE SPACE CHECK"
-          - "VM Storage Used: {{ vm_storage_used_gb }} GB ({{ vm_storage_used_tb }} TB)"
-          - "---"
-          - "{% for result in datastore_info_results.results %}{% for ds in result.datastores %}Datastore: {{ ds.name }}"
-          - "  Free: {{ (ds.freeSpace / 1024 / 1024 / 1024) | round(2) }} GB ({{ (ds.freeSpace / 1024 / 1024 / 1024 / 1024) | round(2) }} TB)"
-          - "  Total: {{ (ds.capacity / 1024 / 1024 / 1024) | round(2) }} GB ({{ (ds.capacity / 1024 / 1024 / 1024 / 1024) | round(2) }} TB)"
-          - "  Status: {{ 'SUFFICIENT ✓' if (ds.freeSpace > vm_storage_used_bytes) else 'INSUFFICIENT ✗' }}"
-          - "{% endfor %}{% endfor %}"
-          - "---"
-          - "Result: {{ 'At least one datastore has sufficient space ✓' if sufficient_space else 'No datastore has sufficient space ✗' }}"
-          - "=========================================="
-      when:
-        - is_powered_on
-        - not (has_existing_snapshots | default(false))
-        - datastore_info_results is defined
-
-    - name: Report insufficient space
-      debug:
-        msg:
-          - "=========================================="
-          - "✗ SKIPPED - Insufficient datastore space"
-          - "{{ inventory_hostname }} requires {{ vm_storage_used_gb }} GB ({{ vm_storage_used_tb }} TB) free space"
-          - "No datastore has sufficient free space"
-          - "=========================================="
-      when:
-        - is_powered_on
-        - not (has_existing_snapshots | default(false))
-        - datastore_info_results is defined
-        - not (sufficient_space | default(false))
-
-    # -------------------------------------------------------------------------
-    # STEP 6: CREATE SNAPSHOT USING MOID (NO FOLDER REQUIRED!)
+    # STEP 3: CREATE SNAPSHOT USING MOID (NO FOLDER REQUIRED!)
     # -------------------------------------------------------------------------
     - name: Create VM snapshot using MOID
       community.vmware.vmware_guest_snapshot:
@@ -182,14 +64,11 @@
         quiesce: no
         memory_dump: no
       delegate_to: localhost
-      when:
-        - is_powered_on
-        - not (has_existing_snapshots | default(false))
-        - sufficient_space | default(false)
+      when: is_powered_on
       register: snapshot_result
 
     # -------------------------------------------------------------------------
-    # STEP 7: REPORT RESULTS
+    # STEP 4: REPORT RESULTS
     # -------------------------------------------------------------------------
     - name: Report snapshot creation success
       debug:
