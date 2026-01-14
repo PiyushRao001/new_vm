@@ -106,34 +106,7 @@
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # -------------------------------------------------------------------------
-    # STEP 5: BUILD DATASTORE MOID TO NAME MAPPING
-    # -------------------------------------------------------------------------
-    - name: Build datastore mapping (MOID to name and details)
-      block:
-        - name: Create empty datastore mapping
-          set_fact:
-            ds_moid_map: {}
-
-        - name: Build MOID to datastore info mapping
-          set_fact:
-            ds_moid_map: >-
-              {{
-                ds_moid_map | combine({
-                  item._moId: {
-                    'name': item.name,
-                    'free_gb': (item.freeSpace / 1073741824) | round(2),
-                    'capacity_gb': (item.capacity / 1073741824) | round(2)
-                  }
-                })
-              }}
-          loop: "{{ all_datastores_info.datastores }}"
-          loop_control:
-            label: "{{ item.name }}"
-
-      when: skip_space_check is not defined
-
-    # -------------------------------------------------------------------------
-    # STEP 6: ANALYZE DATASTORE SPACE PER DATASTORE USED BY VM
+    # STEP 5: ANALYZE DATASTORE SPACE
     # -------------------------------------------------------------------------
     - name: Analyze datastore space availability
       block:
@@ -141,25 +114,63 @@
           set_fact:
             datastore_checks: []
 
-        - name: Build detailed datastore check information
+        - name: Build detailed datastore information with storage usage
           set_fact:
             datastore_checks: >-
               {{
                 datastore_checks + [{
-                  'name': ds_moid_map[item.datastore.split(':')[1]]['name'],
-                  'moid': item.datastore.split(':')[1],
-                  'vm_committed_gb': (item.committed / 1073741824) | round(2),
-                  'vm_uncommitted_gb': (item.uncommitted | default(0) / 1073741824) | round(2),
-                  'required_space_gb': ((item.committed / 1073741824) + safety_margin_gb) | round(2),
-                  'ds_free_gb': ds_moid_map[item.datastore.split(':')[1]]['free_gb'],
-                  'ds_capacity_gb': ds_moid_map[item.datastore.split(':')[1]]['capacity_gb'],
-                  'has_space': (ds_moid_map[item.datastore.split(':')[1]]['free_gb'] | float) >= (((item.committed / 1073741824) + safety_margin_gb) | float)
+                  'name': item.name,
+                  'vm_committed_gb': (
+                    vm_storage_per_ds 
+                    | selectattr('datastore', 'search', item.name) 
+                    | map(attribute='committed') 
+                    | list 
+                    | first 
+                    | default(0) 
+                    / 1073741824
+                  ) | round(2),
+                  'vm_uncommitted_gb': (
+                    vm_storage_per_ds 
+                    | selectattr('datastore', 'search', item.name) 
+                    | map(attribute='uncommitted') 
+                    | list 
+                    | first 
+                    | default(0) 
+                    / 1073741824
+                  ) | round(2),
+                  'required_space_gb': (
+                    (
+                      vm_storage_per_ds 
+                      | selectattr('datastore', 'search', item.name) 
+                      | map(attribute='committed') 
+                      | list 
+                      | first 
+                      | default(0) 
+                      / 1073741824
+                    ) + safety_margin_gb
+                  ) | round(2),
+                  'ds_free_gb': (item.freeSpace / 1073741824) | round(2),
+                  'ds_capacity_gb': (item.capacity / 1073741824) | round(2),
+                  'has_space': (
+                    (item.freeSpace / 1073741824) | float
+                  ) >= (
+                    (
+                      (
+                        vm_storage_per_ds 
+                        | selectattr('datastore', 'search', item.name) 
+                        | map(attribute='committed') 
+                        | list 
+                        | first 
+                        | default(0) 
+                        / 1073741824
+                      ) + safety_margin_gb
+                    ) | float
+                  )
                 }]
               }}
-          loop: "{{ vm_storage_per_ds }}"
+          loop: "{{ vm_info.instance.datastore }}"
           loop_control:
-            label: "{{ item.datastore }}"
-          when: item.datastore.split(':')[1] in ds_moid_map
+            label: "{{ item.name }}"
 
         - name: Display datastore space analysis
           debug:
@@ -168,7 +179,7 @@
               - "Datastore Space Analysis for {{ vm_name }}"
               - "=========================================="
               - "{% for ds in datastore_checks %}"
-              - "Datastore: {{ ds.name }} ({{ ds.moid }})"
+              - "Datastore: {{ ds.name }}"
               - "  VM Committed   : {{ ds.vm_committed_gb }} GB"
               - "  VM Uncommitted : {{ ds.vm_uncommitted_gb }} GB"
               - "  Required Space : {{ ds.required_space_gb }} GB (with {{ safety_margin_gb }} GB margin)"
@@ -207,7 +218,7 @@
               - "✓ All {{ datastore_checks | length }} datastore(s) have sufficient space"
               - "Proceeding with snapshot creation..."
 
-      when: skip_space_check is not defined
+      when: skip_space_check is not defined and vm_info.instance.datastore is defined
 
     - name: Warning if space check skipped
       debug:
@@ -215,7 +226,7 @@
       when: skip_space_check is defined
 
     # -------------------------------------------------------------------------
-    # STEP 7: CREATE SNAPSHOT
+    # STEP 6: CREATE SNAPSHOT
     # -------------------------------------------------------------------------
     - name: Create VM snapshot using MOID
       community.vmware.vmware_guest_snapshot:
@@ -235,7 +246,7 @@
       ignore_errors: yes
 
     # -------------------------------------------------------------------------
-    # STEP 8: REPORT RESULTS
+    # STEP 7: REPORT RESULTS
     # -------------------------------------------------------------------------
     - name: Report snapshot success
       debug:
