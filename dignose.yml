@@ -94,13 +94,19 @@
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
-        name: "{{ item }}"
       delegate_to: localhost
-      loop: "{{ vm_info.instance.hw_datastore }}"
-      register: datastore_info_results
+      register: datastore_info_all
       when:
         - is_powered_on
         - not (has_existing_snapshots | default(false))
+    
+    - name: Filter datastores for this VM only
+      set_fact:
+        datastore_info_results: "{{ {'results': [{'datastores': datastore_info_all.datastores | selectattr('name', 'in', vm_info.instance.hw_datastore) | list}]} }}"
+      when:
+        - is_powered_on
+        - not (has_existing_snapshots | default(false))
+        - datastore_info_all is defined
 
     # -------------------------------------------------------------------------
     # STEP 5: CHECK FREE SPACE ON ALL DATASTORES
