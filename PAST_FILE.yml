@@ -1,253 +1,208 @@
 ---
-- name: VMware Snapshot Creation - AWX OPTIMIZED
+- name: VMware Snapshot Creation with Storage Validation (Fixed)
   hosts: all
   gather_facts: no
   connection: local
-
+  serial: 5
+  
   vars:
-    snapshot_name: "Pre-Patch-Snapshot"
-    snapshot_desc: "Created by Ansible AWX for Maintenance"
-    # Use direct environment variable lookup in validation
-    vcenter_hostname_env: "{{ lookup('env', 'VCENTER_HOSTNAME') | default('') }}"
-    vcenter_username_env: "{{ lookup('env', 'VCENTER_USERNAME') | default('') }}"
-    vcenter_password_env: "{{ lookup('env', 'VCENTER_PASSWORD') | default('') }}"
-    datacenter_name_env: "{{ lookup('env', 'VCENTER_DATACENTER') | default('') }}"
-    space_buffer_pct: 1.2
+    snapshot_name: "Snapshot for patching"
+    snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
+    safety_margin_gb: 10
+    
+    vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
+    vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
+    vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
+    datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
 
   tasks:
     # -------------------------------------------------------------------------
-    # STEP 1: SET VARIABLES WITH PROPER PRECEDENCE
+    # STEP 1: GET VM INFO WITH VSPHERE SCHEMA (includes storage)
     # -------------------------------------------------------------------------
-    - name: Set vCenter variables with precedence
-      set_fact:
-        # Use extra_vars if provided, otherwise use environment variables
-        vcenter_hostname: "{{ vcenter_hostname | default(vcenter_hostname_env) }}"
-        vcenter_username: "{{ vcenter_username | default(vcenter_username_env) }}"
-        vcenter_password: "{{ vcenter_password | default(vcenter_password_env) }}"
-        datacenter_name: "{{ datacenter_name | default(datacenter_name_env) }}"
-      run_once: yes
-
-    # -------------------------------------------------------------------------
-    # STEP 2: VALIDATE INPUTS
-    # -------------------------------------------------------------------------
-    - name: Validate required variables
-      fail:
-        msg: |
-          Missing required vCenter configuration!
-          
-          Set the following in AWX:
-          
-          1. As Environment Variables in Credentials:
-             - VCENTER_HOSTNAME
-             - VCENTER_USERNAME  
-             - VCENTER_PASSWORD
-             - VCENTER_DATACENTER
-          
-          OR
-          
-          2. As Extra Variables in the Job Template:
-             - vcenter_hostname
-             - vcenter_username
-             - vcenter_password
-             - datacenter_name
-          
-          Current values:
-          - vcenter_hostname: {{ vcenter_hostname | default('NOT SET') }}
-          - vcenter_username: {{ vcenter_username | default('NOT SET') }}
-          - vcenter_password: {{ 'SET' if vcenter_password is defined else 'NOT SET' }}
-          - datacenter_name: {{ datacenter_name | default('NOT SET') }}
-      when: >
-        (vcenter_hostname | default('')) == '' or
-        (vcenter_username | default('')) == '' or
-        (vcenter_password | default('')) == '' or
-        (datacenter_name | default('')) == ''
-      run_once: yes
-
-    # -------------------------------------------------------------------------
-    # STEP 3: GET VM INFORMATION
-    # -------------------------------------------------------------------------
-    - name: Get VM information from vCenter
-      vmware_vm_info:
+    - name: Get VM information with vSphere schema
+      community.vmware.vmware_guest_info:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
-        vm_id: "{{ inventory_hostname }}"
+        name: "{{ inventory_hostname }}"
+        schema: vsphere
       delegate_to: localhost
       register: vm_info
       ignore_errors: yes
-      failed_when: >
-        vm_info.failed and 
-        'not found' not in (vm_info.msg | default('')) and
-        'Unable to find' not in (vm_info.msg | default(''))
 
-    - name: Fail if VM not found
-      fail:
-        msg: "VM '{{ inventory_hostname }}' not found in vCenter {{ vcenter_hostname }} (Datacenter: {{ datacenter_name }})"
-      when: vm_info.failed | default(false)
+    - name: Check VM info retrieval
+      block:
+        - debug:
+            msg: "Failed to retrieve VM info for {{ inventory_hostname }}"
+        - meta: end_host
+      when: vm_info is failed or vm_info.instance is not defined
 
-    - name: Extract VM facts
+    # -------------------------------------------------------------------------
+    # STEP 2: EXTRACT VM DETAILS
+    # -------------------------------------------------------------------------
+    - name: Set VM facts from response
       set_fact:
-        vm_moid: "{{ vm_info.virtual_machines[0].moid }}"
-        vm_power_state: "{{ vm_info.virtual_machines[0].power_state }}"
-        vm_storage_mb: "{{ vm_info.virtual_machines[0].disk_sizes | sum | default(0) }}"
-        vm_datastores: "{{ vm_info.virtual_machines[0].datastore | default([]) }}"
-        vm_guest_name: "{{ vm_info.virtual_machines[0].guest_name | default(inventory_hostname) }}"
-      when: vm_info.virtual_machines | length > 0
+        vm_moid: "{{ vm_info.instance.moid }}"
+        vm_power_state: "{{ vm_info.instance.hw_power_status }}"
+        is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
+        vm_datastores: "{{ vm_info.instance.hw_datastores }}"
 
-    # -------------------------------------------------------------------------
-    # STEP 4: CHECK POWER STATE
-    # -------------------------------------------------------------------------
-    - name: Set power state fact
+    - name: Calculate VM storage from files (accurate method)
       set_fact:
-        is_powered_on: "{{ vm_power_state == 'poweredOn' }}"
-      when: vm_power_state is defined
+        vm_storage_bytes: "{{ vm_info.instance.hw_files | map(attribute='size') | map('int') | sum }}"
+      when: vm_info.instance.hw_files is defined
+
+    - name: Convert storage to GB
+      set_fact:
+        vm_storage_gb: "{{ (vm_storage_bytes | int / 1073741824) | round(2) }}"
+      when: vm_storage_bytes is defined
+
+    - name: Set default storage if calculation failed
+      set_fact:
+        vm_storage_gb: 150
+      when: vm_storage_gb is not defined
+
+    - name: Display VM information
+      debug:
+        msg:
+          - "=========================================="
+          - "VM: {{ inventory_hostname }}"
+          - "MOID: {{ vm_moid }}"
+          - "Power State: {{ vm_power_state }}"
+          - "Datastores: {{ vm_datastores | join(', ') }}"
+          - "Storage Used: {{ vm_storage_gb }} GB"
+          - "=========================================="
 
     # -------------------------------------------------------------------------
-    # STEP 5: CHECK DATASTORE FREE SPACE
+    # STEP 3: CHECK POWER STATE
     # -------------------------------------------------------------------------
-    - name: Get datastore information
-      vmware_datastore_info:
+    - name: Skip if powered off
+      block:
+        - debug:
+            msg: "⊘ SKIPPED: {{ inventory_hostname }} is powered off"
+        - meta: end_host
+      when: not is_powered_on
+
+    # -------------------------------------------------------------------------
+    # STEP 4: GET DATASTORE INFORMATION
+    # -------------------------------------------------------------------------
+    - name: Get all datastores in datacenter
+      community.vmware.vmware_datastore_info:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
       delegate_to: localhost
-      register: ds_info
-      when: vm_datastores is defined
-
-    - name: Calculate required space with buffer
-      set_fact:
-        # Convert MB to bytes and add buffer
-        required_space_bytes: "{{ ((vm_storage_mb | default(0) | int) * 1024 * 1024 * space_buffer_pct) | int }}"
-        required_space_gb: "{{ (required_space_bytes / (1024*1024*1024)) | round(2) }}"
-      when: vm_storage_mb is defined
-
-    - name: Check datastore free space
-      set_fact:
-        has_enough_space: >-
-          {% if vm_datastores is defined and vm_datastores %}
-            {% set ns = namespace(found_space=false) %}
-            {% for ds_name in vm_datastores %}
-              {% set ds = ds_info.datastores | selectattr('name', 'equalto', ds_name) | first %}
-              {% if ds and ds.free_space is defined %}
-                {% if ds.free_space > required_space_bytes %}
-                  {% set ns.found_space = true %}
-                {% endif %}
-              {% endif %}
-            {% endfor %}
-            {{ ns.found_space }}
-          {% else %}
-            false
-          {% endif %}
-      when: 
-        - vm_datastores is defined
-        - ds_info is defined
-        - required_space_bytes is defined
+      register: all_datastores
+      ignore_errors: yes
 
     # -------------------------------------------------------------------------
-    # STEP 6: PRE-FLIGHT SUMMARY
+    # STEP 5: ANALYZE SPACE ON VM'S DATASTORES
     # -------------------------------------------------------------------------
-    - name: Display pre-flight check results
-      debug:
-        msg: |
-          ==========================================
-          VM PRE-FLIGHT CHECK - {{ inventory_hostname }}
-          ==========================================
-          VM Name: {{ vm_guest_name }}
-          Power State: {{ vm_power_state }} ({{ '✓ READY' if is_powered_on | default(false) else '✗ SKIP - Powered off' }})
-          Total Storage: {{ vm_storage_mb | default(0) }} MB
-          
-          DATASTORE CHECK:
-          {% if vm_datastores is defined and vm_datastores %}
-            {% for ds_name in vm_datastores %}
-            - {{ ds_name }}:
-              {% set ds = ds_info.datastores | selectattr('name', 'equalto', ds_name) | first %}
-              {% if ds and ds.free_space is defined %}
-                Free: {{ (ds.free_space / (1024*1024*1024)) | round(2) }} GB
-                Needed: {{ required_space_gb | default('N/A') }} GB (with {{ ((space_buffer_pct - 1) * 100) | int }}% buffer)
-                Status: {{ '✓ SUFFICIENT' if ds.free_space > required_space_bytes else '✗ INSUFFICIENT' }}
-              {% else %}
-                ✗ NOT FOUND OR NO FREE SPACE INFO
-              {% endif %}
-            {% endfor %}
-          {% else %}
-            ✗ NO DATASTORES FOUND
-          {% endif %}
-          
-          OVERALL STATUS: {{ '✓ READY FOR SNAPSHOT' if (is_powered_on | default(false)) and (has_enough_space | default(false)) else '✗ NOT READY' }}
-          ==========================================
-      when: vm_info is defined and not vm_info.failed
-
-    # -------------------------------------------------------------------------
-    # STEP 7: CREATE SNAPSHOT
-    # -------------------------------------------------------------------------
-    - block:
-        - name: Create VM snapshot
-          vmware_guest_snapshot:
-            hostname: "{{ vcenter_hostname }}"
-            username: "{{ vcenter_username }}"
-            password: "{{ vcenter_password }}"
-            validate_certs: no
-            datacenter: "{{ datacenter_name }}"
-            folder: "/"
-            name: "{{ inventory_hostname }}"
-            state: present
-            snapshot_name: "{{ snapshot_name }}"
-            description: "{{ snapshot_desc }}"
-            quiesce: no
-            memory_dump: no
-          delegate_to: localhost
-          register: snapshot_result
-
-        - name: Record successful snapshot
+    - name: Check datastore space
+      block:
+        - name: Filter datastores used by this VM
           set_fact:
-            snapshot_created: true
-          when: snapshot_result.changed
+            vm_ds_details: "{{ all_datastores.datastores | selectattr('name', 'in', vm_datastores) | list }}"
 
-      when:
-        - is_powered_on | default(false)
-        - has_enough_space | default(false)
-      rescue:
-        - name: Handle snapshot creation error
+        - name: Calculate required space with safety margin
+          set_fact:
+            required_space_gb: "{{ (vm_storage_gb | float + safety_margin_gb | float) | round(2) }}"
+
+        - name: Build datastore analysis
+          set_fact:
+            ds_analysis: "{{ ds_analysis | default([]) + [{'name': item.name, 'free_gb': (item.freeSpace / 1073741824) | round(2), 'capacity_gb': (item.capacity / 1073741824) | round(2), 'has_space': (item.freeSpace / 1073741824) >= (required_space_gb | float)}] }}"
+          loop: "{{ vm_ds_details }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: Display datastore space analysis
           debug:
-            msg: |
-              ==========================================
-              ✗ SNAPSHOT CREATION FAILED
-              VM: {{ inventory_hostname }}
-              Error: {{ snapshot_result.msg | default('Unknown error') }}
-              ==========================================
+            msg:
+              - "Datastore Space Analysis:"
+              - "Required: {{ required_space_gb }} GB (VM: {{ vm_storage_gb }} GB + Safety: {{ safety_margin_gb }} GB)"
+              - "{% for ds in ds_analysis %}"
+              - "  {{ ds.name }}:"
+              - "    Capacity: {{ ds.capacity_gb }} GB"
+              - "    Free: {{ ds.free_gb }} GB"
+              - "    Status: {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT' }}"
+              - "{% endfor %}"
 
-    # -------------------------------------------------------------------------
-    # STEP 8: FINAL REPORTING
-    # -------------------------------------------------------------------------
-    - name: Display success message
-      debug:
-        msg: |
-          ==========================================
-          ✓ SNAPSHOT CREATION SUCCESSFUL
-          VM: {{ inventory_hostname }}
-          Snapshot: {{ snapshot_name }}
-          Time: {{ ansible_date_time.iso8601 }}
-          ==========================================
-      when: snapshot_created | default(false)
+        - name: Check if any datastore has sufficient space
+          set_fact:
+            can_create_snapshot: "{{ ds_analysis | selectattr('has_space', 'equalto', true) | list | length > 0 }}"
 
-    - name: Display skip reasons
-      debug:
-        msg: |
-          ==========================================
-          ⚠ SNAPSHOT SKIPPED
-          VM: {{ inventory_hostname }}
-          Reason:
-          {% if not (is_powered_on | default(false)) %}
-          - VM is powered off ({{ vm_power_state }})
-          {% endif %}
-          {% if not (has_enough_space | default(false)) %}
-          - Insufficient datastore space
-          {% endif %}
-          ==========================================
+        - name: Skip if no space available
+          block:
+            - debug:
+                msg:
+                  - "⊘ SKIPPED: Insufficient Space"
+                  - "No datastore has {{ required_space_gb }} GB free"
+            - meta: end_host
+          when: not can_create_snapshot
+
       when: 
-        - not (is_powered_on | default(false) and has_enough_space | default(false))
-        - not snapshot_created | default(false)
+        - all_datastores is defined
+        - all_datastores is not failed
+        - all_datastores.datastores is defined
+
+    # -------------------------------------------------------------------------
+    # STEP 6: CREATE SNAPSHOT
+    # -------------------------------------------------------------------------
+    - name: Create VM snapshot
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        moid: "{{ vm_moid }}"
+        state: present
+        snapshot_name: "{{ snapshot_name }}"
+        description: "{{ snapshot_desc }}"
+        quiesce: no
+        memory_dump: no
+      delegate_to: localhost
+      register: snapshot_result
+      ignore_errors: yes
+
+    # -------------------------------------------------------------------------
+    # STEP 7: REPORT RESULTS
+    # -------------------------------------------------------------------------
+    - name: Report success
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ SUCCESS"
+          - "VM: {{ inventory_hostname }}"
+          - "Snapshot: '{{ snapshot_name }}' created"
+          - "Storage: {{ vm_storage_gb }} GB"
+          - "=========================================="
+      when:
+        - snapshot_result is defined
+        - not (snapshot_result is failed)
+        - snapshot_result.changed | default(false)
+
+    - name: Report failure
+      debug:
+        msg:
+          - "=========================================="
+          - "✗ FAILED"
+          - "VM: {{ inventory_hostname }}"
+          - "Error: {{ snapshot_result.msg | default('Snapshot creation failed') }}"
+          - "=========================================="
+      when:
+        - snapshot_result is defined
+        - snapshot_result is failed
+
+    - name: Report no change
+      debug:
+        msg:
+          - "⊘ NO CHANGE - Snapshot may already exist"
+      when:
+        - snapshot_result is defined
+        - not (snapshot_result is failed)
+        - not (snapshot_result.changed | default(false))
