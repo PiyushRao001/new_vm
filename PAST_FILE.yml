@@ -109,7 +109,7 @@
 
     - name: Determine if snapshot can proceed
       set_fact:
-        can_create_snapshot: "{{ datastore_checks | selectattr('has_space', 'equalto', true) | list | length > 0 }}"
+        can_create_snapshot: "{{ datastore_checks | selectattr('has_space', 'equalto', false) | list | length == 0 }}"
 
     # -------------------------------------------------------------------------
     # STEP 5: CREATE SNAPSHOT (ONLY IF SPACE IS AVAILABLE)
@@ -176,8 +176,8 @@
           - "=========================================="
           - "⊘ SKIPPED - Insufficient Datastore Space"
           - "{{ inventory_hostname }} snapshot requires {{ required_space_gb }} GB"
-          - "NONE of the datastores have sufficient free space:"
-          - "{% for ds in datastore_checks %}"
+          - "One or more datastores lack sufficient free space:"
+          - "{% for ds in datastore_checks | selectattr('has_space', 'equalto', false) %}"
           - "  - {{ ds.name }}: {{ (ds.freeSpace / 1024 / 1024 / 1024) | round(2) }} GB free (need {{ required_space_gb }} GB)"
           - "{% endfor %}"
           - "=========================================="
