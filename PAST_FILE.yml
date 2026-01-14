@@ -1,21 +1,22 @@
 ---
-- name: VMware Snapshot Creation - OPTIMAL SOLUTION
+- name: VMware Snapshot Creation with Storage Validation
   hosts: all
   gather_facts: no
   connection: local
- 
+  
   vars:
     snapshot_name: "Snapshot for patching"
     snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
+    safety_margin_gb: 10  # Extra GB to keep free as safety buffer
+    
     vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
     vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
     vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
     datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
- 
+
   tasks:
- 
     # -------------------------------------------------------------------------
-    # STEP 1: GET VM INFO (INCLUDING MOID)
+    # STEP 1: GET VM INFO (INCLUDING MOID AND STORAGE)
     # -------------------------------------------------------------------------
     - name: Get VM information
       community.vmware.vmware_guest_info:
@@ -25,63 +26,93 @@
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
         name: "{{ inventory_hostname }}"
+        schema: vsphere
       delegate_to: localhost
       register: vm_info
- 
+
     # -------------------------------------------------------------------------
-    # STEP 2: GET DATASTORE INFO
+    # STEP 2: EXTRACT VM STORAGE USAGE
     # -------------------------------------------------------------------------
-    - name: Get datastore information
+    - name: Set VM facts
+      set_fact:
+        vm_moid: "{{ vm_info.instance.moid }}"
+        is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
+        vm_datastores: "{{ vm_info.instance.hw_datastore }}"
+        # Get actual committed storage in GB (this is what's really used)
+        vm_storage_committed_gb: "{{ (vm_info.instance.storage.committed | default(0) / 1024 / 1024 / 1024) | round(2) }}"
+        # Get uncommitted storage (thin provisioned space that could be used)
+        vm_storage_uncommitted_gb: "{{ (vm_info.instance.storage.uncommitted | default(0) / 1024 / 1024 / 1024) | round(2) }}"
+
+    - name: Display VM storage information
+      debug:
+        msg:
+          - "=========================================="
+          - "VM Storage Analysis: {{ inventory_hostname }}"
+          - "=========================================="
+          - "MOID                : {{ vm_moid }}"
+          - "Power State         : {{ vm_info.instance.hw_power_status }}"
+          - "Datastores          : {{ vm_datastores | join(', ') }}"
+          - "Committed Storage   : {{ vm_storage_committed_gb }} GB (actual usage)"
+          - "Uncommitted Storage : {{ vm_storage_uncommitted_gb }} GB (thin prov)"
+          - "Total Potential     : {{ (vm_storage_committed_gb | float + vm_storage_uncommitted_gb | float) | round(2) }} GB"
+          - "=========================================="
+
+    # -------------------------------------------------------------------------
+    # STEP 3: CHECK DATASTORE FREE SPACE FOR EACH DATASTORE
+    # -------------------------------------------------------------------------
+    - name: Get datastore information for all VM datastores
       community.vmware.vmware_datastore_info:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
         password: "{{ vcenter_password }}"
         validate_certs: no
         datacenter: "{{ datacenter_name }}"
+        name: "{{ item }}"
       delegate_to: localhost
-      register: ds_info
- 
+      register: datastore_info
+      loop: "{{ vm_datastores }}"
+
     # -------------------------------------------------------------------------
-    # STEP 3: EXTRACT VM + DATASTORE FACTS
+    # STEP 4: CALCULATE SPACE REQUIREMENTS AND VALIDATE
     # -------------------------------------------------------------------------
-    - name: Set VM facts
+    - name: Calculate space requirements
       set_fact:
-        vm_moid: "{{ vm_info.instance.moid }}"
-        is_powered_on: "{{ vm_info.instance.hw_power_status == 'poweredOn' }}"
-        vm_storage_bytes: "{{ vm_info.instance.hw_files | map(attribute='size') | sum }}"
-        vm_datastore_name: "{{ vm_info.instance.hw_datastore[0] }}"
- 
-    - name: Calculate VM storage in GB for display
+        # Snapshot needs approximately the committed storage size
+        # (delta disks will grow based on changes)
+        required_space_gb: "{{ (vm_storage_committed_gb | float + safety_margin_gb | float) | round(2) }}"
+
+    - name: Check if all datastores have sufficient space
       set_fact:
-        vm_storage_gb: "{{ (vm_storage_bytes | int / 1024 / 1024 / 1024) | round(2) }}"
- 
-    - name: Get datastore free space
-      set_fact:
-        datastore_free_bytes: >-
-          {{ (ds_info.datastores
-              | selectattr('name', 'equalto', vm_info.instance.hw_datastore[0])
-              | first).freeSpace }}
- 
-    - name: Determine if datastore has enough space
-      set_fact:
-        has_enough_space: "{{ datastore_free_bytes | int > vm_storage_bytes | int }}"
- 
-    - name: Display pre-flight status
+        datastore_checks: >-
+          {{
+            datastore_info.results | map(attribute='datastores') | flatten |
+            map('combine', {'has_space': (item.freeSpace / 1024 / 1024 / 1024) > (required_space_gb | float)}) |
+            list
+          }}
+
+    - name: Display datastore space analysis
       debug:
         msg:
           - "=========================================="
-          - "VM            : {{ inventory_hostname }}"
-          - "MOID          : {{ vm_moid }}"
-          - "Power State   : {{ vm_info.instance.hw_power_status }}"
-          - "Datastore     : {{ vm_datastore_name }}"
-          - "VM Storage    : {{ vm_storage_gb }} GB"
-          - "Datastore Free: {{ (datastore_free_bytes | int / 1024 / 1024 / 1024) | round(2) }} GB"
-          - "Enough Space? : {{ 'YES ✓' if has_enough_space else 'NO ✗ - Insufficient datastore space' }}"
-          - "Ready         : {{ 'YES ✓' if is_powered_on and has_enough_space else 'NO ✗' }}"
+          - "Datastore Space Analysis"
           - "=========================================="
- 
+          - "Required Space      : {{ required_space_gb }} GB"
+          - "  (VM Usage: {{ vm_storage_committed_gb }} GB + Safety: {{ safety_margin_gb }} GB)"
+          - "---"
+          - "{% for ds in datastore_checks %}"
+          - "Datastore: {{ ds.name }}"
+          - "  Capacity   : {{ (ds.capacity / 1024 / 1024 / 1024) | round(2) }} GB"
+          - "  Free Space : {{ (ds.freeSpace / 1024 / 1024 / 1024) | round(2) }} GB"
+          - "  Status     : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT' }}"
+          - "{% endfor %}"
+          - "=========================================="
+
+    - name: Determine if snapshot can proceed
+      set_fact:
+        can_create_snapshot: "{{ datastore_checks | selectattr('has_space', 'equalto', true) | list | length > 0 }}"
+
     # -------------------------------------------------------------------------
-    # STEP 4: CREATE SNAPSHOT ONLY IF POWERED ON + ENOUGH SPACE
+    # STEP 5: CREATE SNAPSHOT (ONLY IF SPACE IS AVAILABLE)
     # -------------------------------------------------------------------------
     - name: Create VM snapshot using MOID
       community.vmware.vmware_guest_snapshot:
@@ -99,38 +130,57 @@
       delegate_to: localhost
       when:
         - is_powered_on
-        - has_enough_space
+        - can_create_snapshot
       register: snapshot_result
- 
+
     # -------------------------------------------------------------------------
-    # STEP 5: REPORT RESULTS (SINGLE CONSOLIDATED BLOCK)
+    # STEP 6: REPORT RESULTS
     # -------------------------------------------------------------------------
-    - name: Set snapshot status message
-      set_fact:
-        snapshot_status: >-
-          {% if snapshot_result is defined and snapshot_result.changed %}
-          ✓ SUCCESS - Snapshot '{{ snapshot_name }}' created for {{ inventory_hostname }}
-          {% elif snapshot_result is defined and snapshot_result.failed | default(false) %}
-          ✗ FAILED - Could not create snapshot for {{ inventory_hostname }}
-          Error: {{ snapshot_result.msg | default('Unknown error') }}
-          {% elif not is_powered_on and not has_enough_space %}
-          ⊘ SKIPPED - VM powered off AND insufficient datastore space
-          {% elif not is_powered_on %}
-          ⊘ SKIPPED - VM powered off
-          {% elif not has_enough_space %}
-          ⊘ SKIPPED - Insufficient datastore space
-          {% else %}
-          ⊘ SKIPPED - Unknown condition
-          {% endif %}
- 
-    - name: Report snapshot status
+    - name: Report snapshot creation success
       debug:
         msg:
           - "=========================================="
-          - "{{ snapshot_status }}"
-          - "VM Name       : {{ inventory_hostname }}"
-          - "Power State   : {{ vm_info.instance.hw_power_status }}"
-          - "VM Size       : {{ vm_storage_gb }} GB"
-          - "Datastore     : {{ vm_datastore_name }}"
-          - "Free Space    : {{ (datastore_free_bytes | int / 1024 / 1024 / 1024) | round(2) }} GB"
+          - "✓ SUCCESS"
+          - "Snapshot '{{ snapshot_name }}' created for {{ inventory_hostname }}"
+          - "VM Storage: {{ vm_storage_committed_gb }} GB"
+          - "Snapshot will use delta disks on datastores"
           - "=========================================="
+      when:
+        - snapshot_result is defined
+        - snapshot_result.changed
+
+    - name: Report snapshot creation failure
+      debug:
+        msg:
+          - "=========================================="
+          - "✗ FAILED"
+          - "Could not create snapshot for {{ inventory_hostname }}"
+          - "Error: {{ snapshot_result.msg | default('Unknown error') }}"
+          - "=========================================="
+      when:
+        - snapshot_result is defined
+        - snapshot_result.failed | default(false)
+
+    - name: Report skipped (VM powered off)
+      debug:
+        msg:
+          - "=========================================="
+          - "⊘ SKIPPED - VM Powered Off"
+          - "{{ inventory_hostname }} is powered off"
+          - "=========================================="
+      when: not is_powered_on
+
+    - name: Report skipped (insufficient datastore space)
+      debug:
+        msg:
+          - "=========================================="
+          - "⊘ SKIPPED - Insufficient Datastore Space"
+          - "{{ inventory_hostname }} snapshot requires {{ required_space_gb }} GB"
+          - "NONE of the datastores have sufficient free space:"
+          - "{% for ds in datastore_checks %}"
+          - "  - {{ ds.name }}: {{ (ds.freeSpace / 1024 / 1024 / 1024) | round(2) }} GB free (need {{ required_space_gb }} GB)"
+          - "{% endfor %}"
+          - "=========================================="
+      when:
+        - is_powered_on
+        - not can_create_snapshot
