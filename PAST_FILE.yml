@@ -106,7 +106,34 @@
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # -------------------------------------------------------------------------
-    # STEP 5: ANALYZE DATASTORE SPACE PER DATASTORE USED BY VM
+    # STEP 5: BUILD DATASTORE MOID TO NAME MAPPING
+    # -------------------------------------------------------------------------
+    - name: Build datastore mapping (MOID to name and details)
+      block:
+        - name: Create empty datastore mapping
+          set_fact:
+            ds_moid_map: {}
+
+        - name: Build MOID to datastore info mapping
+          set_fact:
+            ds_moid_map: >-
+              {{
+                ds_moid_map | combine({
+                  item._moId: {
+                    'name': item.name,
+                    'free_gb': (item.freeSpace / 1073741824) | round(2),
+                    'capacity_gb': (item.capacity / 1073741824) | round(2)
+                  }
+                })
+              }}
+          loop: "{{ all_datastores_info.datastores }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+      when: skip_space_check is not defined
+
+    # -------------------------------------------------------------------------
+    # STEP 6: ANALYZE DATASTORE SPACE PER DATASTORE USED BY VM
     # -------------------------------------------------------------------------
     - name: Analyze datastore space availability
       block:
@@ -114,39 +141,40 @@
           set_fact:
             datastore_checks: []
 
-        - name: Build detailed datastore information with per-datastore usage
+        - name: Build detailed datastore check information
           set_fact:
             datastore_checks: >-
               {{
                 datastore_checks + [{
-                  'name': item.name,
-                  'free_gb': (item.freeSpace / 1073741824) | round(2),
-                  'capacity_gb': (item.capacity / 1073741824) | round(2),
-                  'vm_committed_gb': (vm_storage_per_ds | selectattr('datastore', 'search', item.name) | map(attribute='committed') | first | default(0) / 1073741824) | round(2),
-                  'vm_uncommitted_gb': (vm_storage_per_ds | selectattr('datastore', 'search', item.name) | map(attribute='uncommitted') | first | default(0) / 1073741824) | round(2),
-                  'required_space_gb': ((vm_storage_per_ds | selectattr('datastore', 'search', item.name) | map(attribute='committed') | first | default(0) / 1073741824) + safety_margin_gb) | round(2),
-                  'has_space': ((item.freeSpace / 1073741824) | float) >= (((vm_storage_per_ds | selectattr('datastore', 'search', item.name) | map(attribute='committed') | first | default(0) / 1073741824) + safety_margin_gb) | float)
+                  'name': ds_moid_map[item.datastore.split(':')[1]]['name'],
+                  'moid': item.datastore.split(':')[1],
+                  'vm_committed_gb': (item.committed / 1073741824) | round(2),
+                  'vm_uncommitted_gb': (item.uncommitted | default(0) / 1073741824) | round(2),
+                  'required_space_gb': ((item.committed / 1073741824) + safety_margin_gb) | round(2),
+                  'ds_free_gb': ds_moid_map[item.datastore.split(':')[1]]['free_gb'],
+                  'ds_capacity_gb': ds_moid_map[item.datastore.split(':')[1]]['capacity_gb'],
+                  'has_space': (ds_moid_map[item.datastore.split(':')[1]]['free_gb'] | float) >= (((item.committed / 1073741824) + safety_margin_gb) | float)
                 }]
               }}
-          loop: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_info.instance.datastore | map(attribute='name') | list) | list }}"
+          loop: "{{ vm_storage_per_ds }}"
           loop_control:
-            label: "{{ item.name }}"
-          when: vm_info.instance.datastore is defined
+            label: "{{ item.datastore }}"
+          when: item.datastore.split(':')[1] in ds_moid_map
 
         - name: Display datastore space analysis
           debug:
             msg:
               - "=========================================="
-              - "Datastore Space Analysis"
+              - "Datastore Space Analysis for {{ vm_name }}"
               - "=========================================="
               - "{% for ds in datastore_checks %}"
-              - "Datastore: {{ ds.name }}"
-              - "  VM Committed  : {{ ds.vm_committed_gb }} GB"
-              - "  VM Uncommitted: {{ ds.vm_uncommitted_gb }} GB"
-              - "  Required Space: {{ ds.required_space_gb }} GB (with {{ safety_margin_gb }} GB safety margin)"
-              - "  DS Capacity   : {{ ds.capacity_gb }} GB"
-              - "  DS Free Space : {{ ds.free_gb }} GB"
-              - "  Status        : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT' }}"
+              - "Datastore: {{ ds.name }} ({{ ds.moid }})"
+              - "  VM Committed   : {{ ds.vm_committed_gb }} GB"
+              - "  VM Uncommitted : {{ ds.vm_uncommitted_gb }} GB"
+              - "  Required Space : {{ ds.required_space_gb }} GB (with {{ safety_margin_gb }} GB margin)"
+              - "  DS Capacity    : {{ ds.ds_capacity_gb }} GB"
+              - "  DS Free Space  : {{ ds.ds_free_gb }} GB"
+              - "  Status         : {{ '✓ SUFFICIENT' if ds.has_space else '✗ INSUFFICIENT' }}"
               - "---"
               - "{% endfor %}"
               - "=========================================="
@@ -161,16 +189,23 @@
                 msg:
                   - "=========================================="
                   - "⊘ SKIPPED: Insufficient space on datastore(s)"
+                  - "VM: {{ vm_name }}"
                   - "---"
                   - "{% for ds in insufficient_datastores %}"
                   - "{{ ds.name }}:"
                   - "  Required : {{ ds.required_space_gb }} GB"
-                  - "  Available: {{ ds.free_gb }} GB"
-                  - "  Shortage : {{ (ds.required_space_gb - ds.free_gb) | round(2) }} GB"
+                  - "  Available: {{ ds.ds_free_gb }} GB"
+                  - "  Shortage : {{ (ds.required_space_gb - ds.ds_free_gb) | round(2) }} GB"
                   - "{% endfor %}"
                   - "=========================================="
             - meta: end_host
           when: insufficient_datastores | length > 0
+
+        - name: All datastores have sufficient space
+          debug:
+            msg:
+              - "✓ All {{ datastore_checks | length }} datastore(s) have sufficient space"
+              - "Proceeding with snapshot creation..."
 
       when: skip_space_check is not defined
 
@@ -180,7 +215,7 @@
       when: skip_space_check is defined
 
     # -------------------------------------------------------------------------
-    # STEP 6: CREATE SNAPSHOT
+    # STEP 7: CREATE SNAPSHOT
     # -------------------------------------------------------------------------
     - name: Create VM snapshot using MOID
       community.vmware.vmware_guest_snapshot:
@@ -200,7 +235,7 @@
       ignore_errors: yes
 
     # -------------------------------------------------------------------------
-    # STEP 7: REPORT RESULTS
+    # STEP 8: REPORT RESULTS
     # -------------------------------------------------------------------------
     - name: Report snapshot success
       debug:
