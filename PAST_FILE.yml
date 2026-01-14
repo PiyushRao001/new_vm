@@ -141,10 +141,11 @@
                   'has_space': ((item.freeSpace / 1073741824) | float) >= (required_space_gb | float)
                 }]
               }}
-          loop: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_info.instance.datastore | map(attribute='name') | list) | list }}"
+          loop: "{{ all_datastores_info.datastores
+          | selectattr('moid', 'in', ds_ids)
+          | list }}"
           loop_control:
             label: "{{ item.name }}"
-          when: vm_info.instance.datastore is defined
 
         - name: Display datastore space analysis
           debug:
