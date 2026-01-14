@@ -67,12 +67,24 @@
     # -------------------------------------------------------------------------
     # STEP 3: EXTRACT STORAGE INFO FROM VSPHERE DATA
     # -------------------------------------------------------------------------
+    - name: Check if storage info is available
+      set_fact:
+        has_storage_info: "{{ vm_info.instance.storage is defined and vm_info.instance.storage.committed is defined }}"
+
     - name: Extract VM storage information
       set_fact:
-        vm_storage_per_ds: "{{ vm_info.instance.storage.perDatastoreUsage }}"
-        vm_total_committed_bytes: "{{ vm_info.instance.storage.perDatastoreUsage | map(attribute='committed') | sum }}"
-        vm_total_uncommitted_bytes: "{{ vm_info.instance.storage.perDatastoreUsage | map(attribute='uncommitted') | sum | default(0) }}"
-      when: vm_info.instance.storage is defined
+        vm_total_committed_bytes: "{{ vm_info.instance.storage.committed }}"
+        vm_total_uncommitted_bytes: "{{ vm_info.instance.storage.uncommitted | default(0) }}"
+        vm_storage_per_ds: "{{ vm_info.instance.storage.perDatastoreUsage | default([]) }}"
+      when: has_storage_info
+
+    - name: Use fallback if storage info unavailable
+      set_fact:
+        vm_total_committed_bytes: 0
+        vm_total_uncommitted_bytes: 0
+        vm_storage_per_ds: []
+        skip_space_check: true
+      when: not has_storage_info
 
     - name: Convert storage to GB
       set_fact:
@@ -93,6 +105,7 @@
           - "Uncommitted Storage: {{ vm_uncommitted_gb }} GB"
           - "Required for Snapshot: {{ required_space_gb }} GB"
           - "Number of Datastores: {{ vm_storage_per_ds | length }}"
+          - "{{ '⚠ Storage info unavailable - using estimates' if not has_storage_info else '' }}"
 
     # -------------------------------------------------------------------------
     # STEP 4: GET DATASTORE DETAILS
@@ -141,11 +154,10 @@
                   'has_space': ((item.freeSpace / 1073741824) | float) >= (required_space_gb | float)
                 }]
               }}
-          loop: "{{ all_datastores_info.datastores
-          | selectattr('moid', 'in', ds_ids)
-          | list }}"
+          loop: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_info.instance.datastore | map(attribute='name') | list) | list }}"
           loop_control:
             label: "{{ item.name }}"
+          when: vm_info.instance.datastore is defined
 
         - name: Display datastore space analysis
           debug:
