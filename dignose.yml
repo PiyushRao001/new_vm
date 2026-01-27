@@ -157,6 +157,29 @@
               - "Found {{ vm_datastores | length }} matching datastore(s)"
               - "VM uses: {{ vm_datastore_names_clean | join(', ') }}"
 
+        - name: Fail if no datastores matched
+          block:
+            - debug:
+                msg:
+                  - "=========================================="
+                  - "✗ ERROR: DATASTORE MISMATCH"
+                  - "=========================================="
+                  - "VM: {{ vm_name }}"
+                  - "VM reports datastores: {{ vm_datastore_names_clean | join(', ') }}"
+                  - "Datacenter: {{ datacenter_name }}"
+                  - "Found: 0 matching datastores"
+                  - ""
+                  - "Possible causes:"
+                  - "1. VM is in a different datacenter"
+                  - "2. Datastore names don't match"
+                  - "3. Permission issues"
+                  - ""
+                  - "Cannot proceed without datastore information."
+                  - "=========================================="
+            - fail:
+                msg: "Cannot find VM datastores in datacenter query - space check is mandatory"
+          when: vm_datastores | length == 0
+
         - name: Build datastore mapping (simplified)
           set_fact:
             ds_name_to_details: {}
