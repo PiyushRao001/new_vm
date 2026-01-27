@@ -1,5 +1,5 @@
 ---
-- name: VMware Snapshot Creation with Storage Validation
+- name: VMware Snapshot Creation with Storage Validation - DIAGNOSTIC VERSION
   hosts: all
   gather_facts: no
   connection: local
@@ -139,42 +139,51 @@
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # -------------------------------------------------------------------------
-    # STEP 6: BUILD DATASTORE MAPPING
+    # DIAGNOSTIC: SHOW ALL DATASTORE NAMES
+    # -------------------------------------------------------------------------
+    - name: DIAGNOSTIC - Show all available datastore names in datacenter
+      debug:
+        msg: 
+          - "==================== DIAGNOSTIC INFO ===================="
+          - "Total datastores in datacenter: {{ all_datastores_info.datastores | length }}"
+          - "Available datastore names:"
+          - "{{ all_datastores_info.datastores | map(attribute='name') | list }}"
+          - ""
+          - "VM is looking for these datastores:"
+          - "{{ vm_datastore_names }}"
+          - ""
+          - "Checking for exact matches..."
+      when: all_datastores_info.datastores is defined
+
+    - name: DIAGNOSTIC - Check each VM datastore individually
+      debug:
+        msg:
+          - "Checking: '{{ item }}'"
+          - "Length: {{ item | length }} chars"
+          - "Match found: {{ item in (all_datastores_info.datastores | map(attribute='name') | list) }}"
+      loop: "{{ vm_datastore_names }}"
+      when: all_datastores_info.datastores is defined
+
+    # -------------------------------------------------------------------------
+    # STEP 6: BUILD DATASTORE MAPPING - WITH TRIMMED NAMES
     # -------------------------------------------------------------------------
     - name: Build datastore mapping for VM's datastores only
       block:
-        - name: Filter datastores used by VM
+        - name: Trim whitespace from VM datastore names
           set_fact:
-            vm_datastores: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_datastore_names) | list }}"
+            vm_datastore_names_clean: "{{ vm_datastore_names | map('trim') | list }}"
+
+        - name: Filter datastores used by VM (case-insensitive with trim)
+          set_fact:
+            vm_datastores: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_datastore_names_clean) | list }}"
 
         - name: Debug filtered datastores
           debug:
             msg:
               - "Found {{ vm_datastores | length }} matching datastore(s)"
-              - "VM uses: {{ vm_datastore_names | join(', ') }}"
+              - "VM uses (cleaned): {{ vm_datastore_names_clean | join(', ') }}"
+              - "Matched datastores: {{ vm_datastores | map(attribute='name') | list }}"
 
-        - name: Create datastore name to details mapping
-          set_fact:
-            ds_name_to_details: >-
-              {{
-                dict(vm_datastores | map(attribute='name') | zip(
-                  vm_datastores | map('dict2items') | map('selectattr', 'key', 'in', ['freeSpace', 'capacity']) | map('items2dict') | map('dict2items') | map('map', attribute='value') | list
-                ))
-                | dict2items
-                | map('combine', {'key': item.key, 'value': {
-                    'free_gb': ((vm_datastores | selectattr('name', 'equalto', item.key) | first).freeSpace / 1073741824) | round(2),
-                    'capacity_gb': ((vm_datastores | selectattr('name', 'equalto', item.key) | first).capacity / 1073741824) | round(2)
-                  }})
-                | items2dict
-                if vm_datastores | length > 0
-                else {}
-              }}
-          loop: "{{ vm_datastores }}"
-          loop_control:
-            label: "{{ item.name }}"
-          when: vm_datastores | length > 0
-
-        # SIMPLIFIED APPROACH - More reliable
         - name: Build datastore mapping (simplified)
           set_fact:
             ds_name_to_details: {}
@@ -203,7 +212,7 @@
       when: skip_space_check is not defined and vm_datastore_names | length > 0
 
     # -------------------------------------------------------------------------
-    # STEP 7: ANALYZE DATASTORE SPACE - COMPARE EACH DS FREE SPACE WITH TOTAL VM STORAGE
+    # STEP 7: ANALYZE DATASTORE SPACE - CHECK EACH DATASTORE
     # -------------------------------------------------------------------------
     - name: Analyze datastore space availability
       block:
@@ -226,7 +235,7 @@
                   'has_space': (ds_name_to_details[item]['free_gb'] | float) >= (required_snapshot_space_gb | float)
                 }]
               }}
-          loop: "{{ vm_datastore_names }}"
+          loop: "{{ vm_datastore_names_clean }}"
           loop_control:
             label: "{{ item }}"
           when: 
