@@ -103,13 +103,19 @@
         vm_total_committed_gb: "{{ (vm_total_committed_bytes | int / 1073741824) | round(2) }}"
       when: has_storage_info
 
-    - name: Use fallback if storage info unavailable
-      set_fact:
-        vm_storage_per_ds: []
-        vm_datastore_names: []
-        vm_datastore_refs: []
-        vm_total_committed_gb: 0
-        skip_space_check: true
+    - name: Fail if storage info unavailable
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ ERROR: Cannot retrieve VM storage information"
+              - "=========================================="
+              - "VM: {{ vm_name }}"
+              - "Storage information is required for space check"
+              - "Cannot proceed without storage data"
+              - "=========================================="
+        - fail:
+            msg: "VM storage information unavailable - space check is mandatory"
       when: not has_storage_info
 
     - name: Display VM total storage
@@ -120,252 +126,192 @@
           - "Datastores: {{ vm_datastore_names | join(', ') }}"
 
     # -------------------------------------------------------------------------
-    # STEP 5: GET DATASTORE DETAILS
+    # STEP 5: GET DATASTORE DETAILS (WITHOUT DATACENTER FILTER)
     # -------------------------------------------------------------------------
-    - name: Get all datastores in datacenter
+    - name: Get all datastores (global query - no datacenter filter)
       community.vmware.vmware_datastore_info:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
         password: "{{ vcenter_password }}"
         validate_certs: no
-        datacenter: "{{ datacenter_name }}"
+        # No datacenter parameter - query all datastores across vCenter
       delegate_to: localhost
       register: all_datastores_info
       ignore_errors: yes
 
-    # ===== DIAGNOSTIC TASKS =====
-    - name: DIAGNOSTIC - List all available datastores in datacenter
-      debug:
-        msg: 
-          - "=========================================="
-          - "DIAGNOSTIC: Available Datastores in {{ datacenter_name }}"
-          - "=========================================="
-          - "Total datastores found: {{ all_datastores_info.datastores | length }}"
-          - ""
-          - "Datastore names:"
-          - "{{ all_datastores_info.datastores | map(attribute='name') | list | join(', ') }}"
-          - "=========================================="
-      when: all_datastores_info is defined and all_datastores_info.datastores is defined
-
-    - name: DIAGNOSTIC - Check if VM datastores contain pattern
-      debug:
-        msg:
-          - "=========================================="
-          - "DIAGNOSTIC: Datastore Name Analysis"
-          - "=========================================="
-          - "VM reports: {{ vm_datastore_names | join(', ') }}"
-          - ""
-          - "Checking for similar names in datacenter:"
-          - "{% for ds in all_datastores_info.datastores %}{% if 'AFF' in ds.name or 'DS06' in ds.name or 'DS49' in ds.name %}- {{ ds.name }}{% endif %}{% endfor %}"
-          - "=========================================="
-      when: all_datastores_info is defined and all_datastores_info.datastores is defined
-
-    - name: DIAGNOSTIC - Try querying datastores without datacenter filter
-      community.vmware.vmware_datastore_info:
-        hostname: "{{ vcenter_hostname }}"
-        username: "{{ vcenter_username }}"
-        password: "{{ vcenter_password }}"
-        validate_certs: no
-        # No datacenter parameter - query all
-      delegate_to: localhost
-      register: all_datastores_no_dc
-      ignore_errors: yes
-
-    - name: DIAGNOSTIC - Check if datastores exist globally
-      debug:
-        msg:
-          - "=========================================="
-          - "DIAGNOSTIC: Global Datastore Search"
-          - "=========================================="
-          - "Searching for VM_AFFDS06 and VM_AFFDS49 across all datacenters..."
-          - ""
-          - "{% set found_ds = all_datastores_no_dc.datastores | selectattr('name', 'in', ['VM_AFFDS06', 'VM_AFFDS49']) | list %}{% if found_ds | length > 0 %}FOUND {{ found_ds | length }} datastore(s):{% for ds in found_ds %}"
-          - "- {{ ds.name }}"
-          - "  Capacity: {{ (ds.capacity / 1073741824) | round(2) }} GB"
-          - "  Free: {{ (ds.freeSpace / 1073741824) | round(2) }} GB{% endfor %}{% else %}NOT FOUND in any datacenter visible to this account{% endif %}"
-          - "=========================================="
-      when: all_datastores_no_dc is defined and all_datastores_no_dc.datastores is defined
-    # ===== END DIAGNOSTIC TASKS =====
-
     - name: Check datastore info retrieval
-      set_fact:
-        skip_space_check: true
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ ERROR: Failed to retrieve datastore information"
+              - "=========================================="
+              - "Cannot query datastores from vCenter"
+              - "Space check cannot be performed"
+              - "=========================================="
+        - fail:
+            msg: "Datastore query failed - space check is mandatory"
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # -------------------------------------------------------------------------
     # STEP 6: BUILD DATASTORE MAPPING
     # -------------------------------------------------------------------------
-    - name: Build datastore mapping for VM's datastores only
+    - name: Trim whitespace from VM datastore names
+      set_fact:
+        vm_datastore_names_clean: "{{ vm_datastore_names | map('trim') | list }}"
+
+    - name: Filter datastores used by VM
+      set_fact:
+        vm_datastores: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_datastore_names_clean) | list }}"
+
+    - name: Debug filtered datastores
+      debug:
+        msg:
+          - "Found {{ vm_datastores | length }} matching datastore(s)"
+          - "VM uses: {{ vm_datastore_names_clean | join(', ') }}"
+
+    - name: Fail if no datastores matched
       block:
-        - name: Trim whitespace from VM datastore names
-          set_fact:
-            vm_datastore_names_clean: "{{ vm_datastore_names | map('trim') | list }}"
-
-        - name: Filter datastores used by VM
-          set_fact:
-            vm_datastores: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_datastore_names_clean) | list }}"
-
-        - name: Debug filtered datastores
-          debug:
+        - debug:
             msg:
-              - "Found {{ vm_datastores | length }} matching datastore(s)"
-              - "VM uses: {{ vm_datastore_names_clean | join(', ') }}"
+              - "=========================================="
+              - "✗ ERROR: DATASTORE MISMATCH"
+              - "=========================================="
+              - "VM: {{ vm_name }}"
+              - "VM reports datastores: {{ vm_datastore_names_clean | join(', ') }}"
+              - "vCenter: {{ vcenter_hostname }}"
+              - "Found: 0 matching datastores"
+              - ""
+              - "Total datastores visible: {{ all_datastores_info.datastores | length }}"
+              - ""
+              - "Possible causes:"
+              - "1. Datastore names don't match exactly"
+              - "2. Permission issues - service account cannot see these datastores"
+              - "3. Datastores are on different vCenter"
+              - ""
+              - "Cannot proceed without datastore information."
+              - "=========================================="
+        - fail:
+            msg: "Cannot find VM datastores in vCenter query - space check is mandatory"
+      when: vm_datastores | length == 0
 
-        - name: Fail if no datastores matched
-          block:
-            - debug:
-                msg:
-                  - "=========================================="
-                  - "✗ ERROR: DATASTORE MISMATCH"
-                  - "=========================================="
-                  - "VM: {{ vm_name }}"
-                  - "VM reports datastores: {{ vm_datastore_names_clean | join(', ') }}"
-                  - "Datacenter: {{ datacenter_name }}"
-                  - "Found: 0 matching datastores"
-                  - ""
-                  - "Possible causes:"
-                  - "1. VM is in a different datacenter"
-                  - "2. Datastore names don't match"
-                  - "3. Permission issues"
-                  - ""
-                  - "Cannot proceed without datastore information."
-                  - "=========================================="
-            - fail:
-                msg: "Cannot find VM datastores in datacenter query - space check is mandatory"
-          when: vm_datastores | length == 0
+    - name: Build datastore mapping
+      set_fact:
+        ds_name_to_details: {}
 
-        - name: Build datastore mapping (simplified)
-          set_fact:
-            ds_name_to_details: {}
-          when: vm_datastores | length > 0
-
-        - name: Populate datastore details
-          set_fact:
-            ds_name_to_details: >-
-              {{
-                ds_name_to_details | combine({
-                  item.name: {
-                    'free_gb': (item.freeSpace / 1073741824) | round(2),
-                    'capacity_gb': (item.capacity / 1073741824) | round(2)
-                  }
-                })
-              }}
-          loop: "{{ vm_datastores }}"
-          loop_control:
-            label: "{{ item.name }}"
-          when: vm_datastores | length > 0
-
-      when: skip_space_check is not defined and vm_datastore_names | length > 0
+    - name: Populate datastore details
+      set_fact:
+        ds_name_to_details: >-
+          {{
+            ds_name_to_details | combine({
+              item.name: {
+                'free_gb': (item.freeSpace / 1073741824) | round(2),
+                'capacity_gb': (item.capacity / 1073741824) | round(2)
+              }
+            })
+          }}
+      loop: "{{ vm_datastores }}"
+      loop_control:
+        label: "{{ item.name }}"
 
     # -------------------------------------------------------------------------
     # STEP 7: ANALYZE DATASTORE SPACE - CHECK EACH DATASTORE
     # -------------------------------------------------------------------------
-    - name: Analyze datastore space availability
+    - name: Calculate required space for snapshot (total VM storage + margin)
+      set_fact:
+        required_snapshot_space_gb: "{{ ((vm_total_committed_gb | float) + (safety_margin_gb | float)) | round(2) | float }}"
+
+    - name: Create datastore checks list
+      set_fact:
+        datastore_checks: []
+
+    - name: Build datastore check information - compare DS free space with TOTAL VM storage
+      set_fact:
+        datastore_checks: >-
+          {{
+            datastore_checks + [{
+              'name': item,
+              'ds_free_gb': ds_name_to_details[item]['free_gb'],
+              'ds_capacity_gb': ds_name_to_details[item]['capacity_gb'],
+              'has_space': (ds_name_to_details[item]['free_gb'] | float) >= (required_snapshot_space_gb | float)
+            }]
+          }}
+      loop: "{{ vm_datastore_names_clean }}"
+      loop_control:
+        label: "{{ item }}"
+      when: 
+        - ds_name_to_details is defined
+        - item in ds_name_to_details
+
+    - name: Display datastore space analysis
+      debug:
+        msg: |
+          ==========================================
+          Datastore Space Analysis for {{ vm_name }}
+          ==========================================
+          VM Total Storage        : {{ vm_total_committed_gb }} GB
+          Required for Snapshot   : {{ required_snapshot_space_gb }} GB (VM storage + {{ safety_margin_gb }} GB margin)
+          
+          Checking if ANY datastore has >= {{ required_snapshot_space_gb }} GB free space:
+          ---
+          {% for ds in datastore_checks %}
+          Datastore: {{ ds.name }}
+            DS Free Space  : {{ ds.ds_free_gb }} GB
+            DS Capacity    : {{ ds.ds_capacity_gb }} GB
+            Can fit VM?    : {{ '✓ YES - This datastore can hold the snapshot' if ds.has_space else '✗ NO - Free space < ' ~ required_snapshot_space_gb ~ ' GB' }}
+          ---
+          {% endfor %}
+          ==========================================
+
+    - name: Check if AT LEAST ONE datastore has sufficient space
+      set_fact:
+        datastores_with_space: "{{ datastore_checks | selectattr('has_space', 'equalto', true) | list }}"
+
+    - name: Fail if NO datastore has sufficient space
       block:
-        - name: Calculate required space for snapshot (total VM storage + margin)
-          set_fact:
-            required_snapshot_space_gb: "{{ ((vm_total_committed_gb | float) + (safety_margin_gb | float)) | round(2) | float }}"
-
-        - name: Create datastore checks list
-          set_fact:
-            datastore_checks: []
-
-        - name: Build datastore check information - compare DS free space with TOTAL VM storage
-          set_fact:
-            datastore_checks: >-
-              {{
-                datastore_checks + [{
-                  'name': item,
-                  'ds_free_gb': ds_name_to_details[item]['free_gb'],
-                  'ds_capacity_gb': ds_name_to_details[item]['capacity_gb'],
-                  'has_space': (ds_name_to_details[item]['free_gb'] | float) >= (required_snapshot_space_gb | float)
-                }]
-              }}
-          loop: "{{ vm_datastore_names_clean }}"
-          loop_control:
-            label: "{{ item }}"
-          when: 
-            - ds_name_to_details is defined
-            - item in ds_name_to_details
-
-        - name: Display datastore space analysis
-          debug:
+        - debug:
             msg: |
               ==========================================
-              Datastore Space Analysis for {{ vm_name }}
-              ==========================================
-              VM Total Storage        : {{ vm_total_committed_gb }} GB
-              Required for Snapshot   : {{ required_snapshot_space_gb }} GB (VM storage + {{ safety_margin_gb }} GB margin)
-              
-              Checking if ANY datastore has >= {{ required_snapshot_space_gb }} GB free space:
-              ---
-              {% for ds in datastore_checks %}
-              Datastore: {{ ds.name }}
-                DS Free Space  : {{ ds.ds_free_gb }} GB
-                DS Capacity    : {{ ds.ds_capacity_gb }} GB
-                Can fit VM?    : {{ '✓ YES - This datastore can hold the snapshot' if ds.has_space else '✗ NO - Free space < ' ~ required_snapshot_space_gb ~ ' GB' }}
-              ---
-              {% endfor %}
-              ==========================================
-
-        - name: Check if AT LEAST ONE datastore has sufficient space
-          set_fact:
-            datastores_with_space: "{{ datastore_checks | selectattr('has_space', 'equalto', true) | list }}"
-
-        - name: Skip if NO datastore has sufficient space
-          block:
-            - debug:
-                msg: |
-                  ==========================================
-                  ⊘ SNAPSHOT CREATION SKIPPED
-                  ==========================================
-                  VM: {{ vm_name }}
-                  VM Total Storage: {{ vm_total_committed_gb }} GB
-                  Required Space  : {{ required_snapshot_space_gb }} GB
-                  
-                  Reason: NO datastore has enough free space to hold the entire VM snapshot.
-                  
-                  Datastore free space summary:
-                  {% for ds in datastore_checks %}
-                  
-                  {{ ds.name }}:
-                    Free Space : {{ ds.ds_free_gb }} GB
-                    Shortage   : {{ ((required_snapshot_space_gb | float) - (ds.ds_free_gb | float)) | round(2) }} GB
-                  {% endfor %}
-                  
-                  At least ONE datastore needs {{ required_snapshot_space_gb }} GB free space.
-                  ==========================================
-            - meta: end_host
-          when: datastores_with_space | length == 0
-
-        - name: At least one datastore has sufficient space
-          debug:
-            msg: |
-              ==========================================
-              ✓ SPACE CHECK PASSED
+              ✗ INSUFFICIENT SPACE - SNAPSHOT BLOCKED
               ==========================================
               VM: {{ vm_name }}
-              Total VM Storage: {{ vm_total_committed_gb }} GB
+              VM Total Storage: {{ vm_total_committed_gb }} GB
               Required Space  : {{ required_snapshot_space_gb }} GB
               
-              {{ datastores_with_space | length }} datastore(s) have sufficient space:
-              {% for ds in datastores_with_space %}
-              - {{ ds.name }}: {{ ds.ds_free_gb }} GB free
+              Reason: NO datastore has enough free space to hold the entire VM snapshot.
+              
+              Datastore free space summary:
+              {% for ds in datastore_checks %}
+              
+              {{ ds.name }}:
+                Free Space : {{ ds.ds_free_gb }} GB
+                Shortage   : {{ ((required_snapshot_space_gb | float) - (ds.ds_free_gb | float)) | round(2) }} GB
               {% endfor %}
               
-              Proceeding with snapshot creation...
+              At least ONE datastore needs {{ required_snapshot_space_gb }} GB free space.
+              Cannot proceed with snapshot creation.
               ==========================================
+        - fail:
+            msg: "Insufficient datastore space - snapshot creation blocked"
+      when: datastores_with_space | length == 0
 
-      when: 
-        - skip_space_check is not defined
-        - vm_datastore_names | length > 0
-        - ds_name_to_details is defined
-        - ds_name_to_details | length > 0
-
-    - name: Warning if space check skipped
+    - name: Space check passed
       debug:
-        msg: "⚠ WARNING: Datastore space check skipped, proceeding anyway"
-      when: skip_space_check is defined or ds_name_to_details is not defined or ds_name_to_details | length == 0
+        msg: |
+          ==========================================
+          ✓ SPACE CHECK PASSED
+          ==========================================
+          VM: {{ vm_name }}
+          Total VM Storage: {{ vm_total_committed_gb }} GB
+          Required Space  : {{ required_snapshot_space_gb }} GB
+          
+          {{ datastores_with_space | length }} datastore(s) have sufficient space:
+          {% for ds in datastores_with_space %}
+          - {{ ds.name }}: {{ ds.ds_free_gb }} GB free
+          {% endfor %}
+          
+          Proceeding with snapshot creation...
+          ==========================================
 
     # -------------------------------------------------------------------------
     # STEP 8: CREATE SNAPSHOT
@@ -401,33 +347,3 @@
           - "VM Total Storage: {{ vm_total_committed_gb }} GB"
           - "=========================================="
       when:
-        - snapshot_result is defined
-        - not (snapshot_result is failed)
-        - snapshot_result.changed | default(false)
-
-    - name: Report snapshot failure
-      debug:
-        msg:
-          - "=========================================="
-          - "✗ SNAPSHOT CREATION FAILED"
-          - "=========================================="
-          - "VM: {{ vm_name }}"
-          - "Error: {{ snapshot_result.msg | default('Snapshot creation failed') }}"
-          - "=========================================="
-      when:
-        - snapshot_result is defined
-        - snapshot_result is failed
-
-    - name: Report no change
-      debug:
-        msg:
-          - "=========================================="
-          - "⊘ NO CHANGE"
-          - "=========================================="
-          - "VM: {{ vm_name }}"
-          - "Snapshot may already exist or no changes were made"
-          - "=========================================="
-      when:
-        - snapshot_result is defined
-        - not (snapshot_result is failed)
-        - not (snapshot_result.changed | default(false))
