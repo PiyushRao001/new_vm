@@ -133,6 +133,60 @@
       register: all_datastores_info
       ignore_errors: yes
 
+    # ===== DIAGNOSTIC TASKS =====
+    - name: DIAGNOSTIC - List all available datastores in datacenter
+      debug:
+        msg: 
+          - "=========================================="
+          - "DIAGNOSTIC: Available Datastores in {{ datacenter_name }}"
+          - "=========================================="
+          - "Total datastores found: {{ all_datastores_info.datastores | length }}"
+          - ""
+          - "Datastore names:"
+          - "{{ all_datastores_info.datastores | map(attribute='name') | list | join(', ') }}"
+          - "=========================================="
+      when: all_datastores_info is defined and all_datastores_info.datastores is defined
+
+    - name: DIAGNOSTIC - Check if VM datastores contain pattern
+      debug:
+        msg:
+          - "=========================================="
+          - "DIAGNOSTIC: Datastore Name Analysis"
+          - "=========================================="
+          - "VM reports: {{ vm_datastore_names | join(', ') }}"
+          - ""
+          - "Checking for similar names in datacenter:"
+          - "{% for ds in all_datastores_info.datastores %}{% if 'AFF' in ds.name or 'DS06' in ds.name or 'DS49' in ds.name %}- {{ ds.name }}{% endif %}{% endfor %}"
+          - "=========================================="
+      when: all_datastores_info is defined and all_datastores_info.datastores is defined
+
+    - name: DIAGNOSTIC - Try querying datastores without datacenter filter
+      community.vmware.vmware_datastore_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        # No datacenter parameter - query all
+      delegate_to: localhost
+      register: all_datastores_no_dc
+      ignore_errors: yes
+
+    - name: DIAGNOSTIC - Check if datastores exist globally
+      debug:
+        msg:
+          - "=========================================="
+          - "DIAGNOSTIC: Global Datastore Search"
+          - "=========================================="
+          - "Searching for VM_AFFDS06 and VM_AFFDS49 across all datacenters..."
+          - ""
+          - "{% set found_ds = all_datastores_no_dc.datastores | selectattr('name', 'in', ['VM_AFFDS06', 'VM_AFFDS49']) | list %}{% if found_ds | length > 0 %}FOUND {{ found_ds | length }} datastore(s):{% for ds in found_ds %}"
+          - "- {{ ds.name }}"
+          - "  Capacity: {{ (ds.capacity / 1073741824) | round(2) }} GB"
+          - "  Free: {{ (ds.freeSpace / 1073741824) | round(2) }} GB{% endfor %}{% else %}NOT FOUND in any datacenter visible to this account{% endif %}"
+          - "=========================================="
+      when: all_datastores_no_dc is defined and all_datastores_no_dc.datastores is defined
+    # ===== END DIAGNOSTIC TASKS =====
+
     - name: Check datastore info retrieval
       set_fact:
         skip_space_check: true
