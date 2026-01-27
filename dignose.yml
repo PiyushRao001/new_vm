@@ -1,5 +1,5 @@
 ---
-- name: VMware Snapshot Creation with Storage Validation - DIAGNOSTIC VERSION
+- name: VMware Snapshot Creation with Storage Validation
   hosts: all
   gather_facts: no
   connection: local
@@ -139,33 +139,7 @@
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # -------------------------------------------------------------------------
-    # DIAGNOSTIC: SHOW ALL DATASTORE NAMES
-    # -------------------------------------------------------------------------
-    - name: DIAGNOSTIC - Show all available datastore names in datacenter
-      debug:
-        msg: 
-          - "==================== DIAGNOSTIC INFO ===================="
-          - "Total datastores in datacenter: {{ all_datastores_info.datastores | length }}"
-          - "Available datastore names:"
-          - "{{ all_datastores_info.datastores | map(attribute='name') | list }}"
-          - ""
-          - "VM is looking for these datastores:"
-          - "{{ vm_datastore_names }}"
-          - ""
-          - "Checking for exact matches..."
-      when: all_datastores_info.datastores is defined
-
-    - name: DIAGNOSTIC - Check each VM datastore individually
-      debug:
-        msg:
-          - "Checking: '{{ item }}'"
-          - "Length: {{ item | length }} chars"
-          - "Match found: {{ item in (all_datastores_info.datastores | map(attribute='name') | list) }}"
-      loop: "{{ vm_datastore_names }}"
-      when: all_datastores_info.datastores is defined
-
-    # -------------------------------------------------------------------------
-    # STEP 6: BUILD DATASTORE MAPPING - WITH TRIMMED NAMES
+    # STEP 6: BUILD DATASTORE MAPPING
     # -------------------------------------------------------------------------
     - name: Build datastore mapping for VM's datastores only
       block:
@@ -173,7 +147,7 @@
           set_fact:
             vm_datastore_names_clean: "{{ vm_datastore_names | map('trim') | list }}"
 
-        - name: Filter datastores used by VM (case-insensitive with trim)
+        - name: Filter datastores used by VM
           set_fact:
             vm_datastores: "{{ all_datastores_info.datastores | selectattr('name', 'in', vm_datastore_names_clean) | list }}"
 
@@ -181,8 +155,7 @@
           debug:
             msg:
               - "Found {{ vm_datastores | length }} matching datastore(s)"
-              - "VM uses (cleaned): {{ vm_datastore_names_clean | join(', ') }}"
-              - "Matched datastores: {{ vm_datastores | map(attribute='name') | list }}"
+              - "VM uses: {{ vm_datastore_names_clean | join(', ') }}"
 
         - name: Build datastore mapping (simplified)
           set_fact:
@@ -204,10 +177,6 @@
           loop_control:
             label: "{{ item.name }}"
           when: vm_datastores | length > 0
-
-        - name: Debug datastore mapping
-          debug:
-            var: ds_name_to_details
 
       when: skip_space_check is not defined and vm_datastore_names | length > 0
 
@@ -313,13 +282,13 @@
       when: 
         - skip_space_check is not defined
         - vm_datastore_names | length > 0
-        - datastore_checks is defined
-        - datastore_checks | length > 0
+        - ds_name_to_details is defined
+        - ds_name_to_details | length > 0
 
     - name: Warning if space check skipped
       debug:
         msg: "⚠ WARNING: Datastore space check skipped, proceeding anyway"
-      when: skip_space_check is defined or datastore_checks is not defined or datastore_checks | length == 0
+      when: skip_space_check is defined or ds_name_to_details is not defined or ds_name_to_details | length == 0
 
     # -------------------------------------------------------------------------
     # STEP 8: CREATE SNAPSHOT
