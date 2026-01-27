@@ -10,10 +10,10 @@
     snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
     safety_margin_gb: 10
     
-    vcenter_hostname: "{{ vcenter_host }}"
-    vcenter_username: "{{ vcenter_username }}"
-    vcenter_password: "{{ vcenter_password }}"
-    datacenter_name: "{{ datacenter_name | default('Production') }}"
+    vcenter_hostname: "{{ lookup('env', 'VMWARE_HOST') }}"
+    vcenter_username: "{{ lookup('env', 'VMWARE_USER') }}"
+    vcenter_password: "{{ lookup('env', 'VMWARE_PASSWORD') }}"
+    datacenter_name: "{{ datacenter_name }}"
 
   tasks:
     # -------------------------------------------------------------------------
