@@ -13,7 +13,7 @@
     vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
     vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
     vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
-    datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
+    datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') | default('Production') }}"
 
   tasks:
     # -------------------------------------------------------------------------
