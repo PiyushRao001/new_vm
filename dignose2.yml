@@ -1,5 +1,5 @@
 ---
-- name: VMware Snapshot with Automatic VM Discovery
+- name: VMware Snapshot with Full Auto-Discovery (Ignores AWX Credential DC/Folder)
   hosts: all
   gather_facts: no
   connection: local
@@ -10,11 +10,25 @@
     snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
     safety_margin_gb: 10
     
+    # Only use vCenter connection details from credential
     vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
     vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
     vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
+    # IMPORTANT: We DO NOT use VCENTER_DATACENTER or any folder variables
+    # The playbook discovers these automatically
 
   tasks:
+    - name: Display execution info
+      debug:
+        msg:
+          - "=========================================="
+          - "VMware Snapshot - Auto Discovery Mode"
+          - "=========================================="
+          - "Target VM: {{ inventory_hostname }}"
+          - "vCenter: {{ vcenter_hostname }}"
+          - "Mode: Auto-discover datacenter and folder"
+          - "=========================================="
+
     # =========================================================================
     # STEP 1: FIND VM ACROSS ALL DATACENTERS (NO DATACENTER FILTER)
     # =========================================================================
@@ -36,18 +50,23 @@
               - "=========================================="
               - "✗ ERROR: Failed to query VMs from vCenter"
               - "=========================================="
+              - "vCenter: {{ vcenter_hostname }}"
               - "Cannot search for VMs"
               - "Check vCenter credentials and connectivity"
               - "=========================================="
         - meta: end_host
       when: all_vms_info is failed
 
+    - name: Display total VMs found
+      debug:
+        msg: "Total VMs visible in vCenter: {{ all_vms_info.virtual_machines | length }}"
+
     # =========================================================================
     # STEP 2: FIND THE SPECIFIC VM BY NAME
     # =========================================================================
-    - name: Filter to find our target VM
+    - name: Filter to find our target VM by name
       set_fact:
-        target_vm: "{{ all_vms_info.virtual_machines | selectattr('guest_name', 'equalto', inventory_hostname) | list | first | default(None) }}"
+        matching_vms: "{{ all_vms_info.virtual_machines | selectattr('guest_name', 'equalto', inventory_hostname) | list }}"
       when: all_vms_info.virtual_machines is defined
 
     - name: Check if VM was found
@@ -57,22 +76,31 @@
               - "=========================================="
               - "✗ VM NOT FOUND"
               - "=========================================="
-              - "VM Name: {{ inventory_hostname }}"
+              - "Looking for VM: {{ inventory_hostname }}"
               - "vCenter: {{ vcenter_hostname }}"
               - ""
-              - "This VM does not exist in any datacenter"
+              - "This VM does not exist in vCenter"
               - "or the service account cannot see it."
               - ""
               - "Total VMs visible: {{ all_vms_info.virtual_machines | length }}"
+              - ""
+              - "Troubleshooting:"
+              - "1. Verify VM name matches exactly (case-sensitive)"
+              - "2. Check service account has permissions"
+              - "3. Confirm VM is powered on or exists"
               - "=========================================="
         - meta: end_host
-      when: target_vm is none or target_vm == None
+      when: matching_vms is not defined or matching_vms | length == 0
+
+    - name: Set target VM
+      set_fact:
+        target_vm: "{{ matching_vms[0] }}"
 
     - name: Display discovered VM information
       debug:
         msg:
           - "=========================================="
-          - "✓ VM FOUND"
+          - "✓ VM FOUND - AUTO-DISCOVERED LOCATION"
           - "=========================================="
           - "VM Name      : {{ target_vm.guest_name }}"
           - "UUID         : {{ target_vm.uuid }}"
@@ -83,9 +111,25 @@
           - "=========================================="
 
     # =========================================================================
-    # STEP 3: GET DETAILED VM INFO USING UUID (WORKS ACROSS ALL DATACENTERS)
+    # STEP 3: CHECK POWER STATE
     # =========================================================================
-    - name: Get detailed VM information using UUID
+    - name: Skip if powered off
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "⊘ SKIPPED: VM is powered off"
+              - "=========================================="
+              - "VM: {{ target_vm.guest_name }}"
+              - "Power State: {{ target_vm.power_state }}"
+              - "=========================================="
+        - meta: end_host
+      when: target_vm.power_state != 'poweredOn'
+
+    # =========================================================================
+    # STEP 4: GET DETAILED VM INFO USING UUID
+    # =========================================================================
+    - name: Get detailed VM information using UUID (works across all datacenters)
       community.vmware.vmware_guest_info:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
@@ -100,41 +144,28 @@
     - name: Check VM detailed info retrieval
       block:
         - debug:
-            msg: "✗ Failed to retrieve detailed VM info for {{ inventory_hostname }}"
+            msg:
+              - "=========================================="
+              - "✗ ERROR: Failed to get detailed VM info"
+              - "=========================================="
+              - "VM: {{ inventory_hostname }}"
+              - "UUID: {{ target_vm.uuid }}"
+              - "=========================================="
         - meta: end_host
       when: vm_info is failed or vm_info.instance is not defined
 
     # =========================================================================
-    # STEP 4: EXTRACT VM FACTS
+    # STEP 5: EXTRACT VM FACTS
     # =========================================================================
-    - name: Set VM basic facts
+    - name: Set VM facts
       set_fact:
         vm_moid: "{{ vm_info.instance._vimref.split(':')[1] }}"
         vm_name: "{{ vm_info.instance.name }}"
-        vm_power_state: "{{ vm_info.instance.runtime.powerState }}"
-        is_powered_on: "{{ vm_info.instance.runtime.powerState == 'poweredOn' }}"
         vm_datacenter: "{{ target_vm.datacenter }}"
         vm_folder: "{{ target_vm.vm_folder }}"
 
-    - name: Display VM operational info
-      debug:
-        msg:
-          - "VM: {{ vm_name }}"
-          - "MOID: {{ vm_moid }}"
-          - "Datacenter: {{ vm_datacenter }}"
-          - "Folder: {{ vm_folder }}"
-          - "Power: {{ vm_power_state }}"
-
-    # Check power state
-    - name: Skip if powered off
-      block:
-        - debug:
-            msg: "⊘ SKIPPED: {{ vm_name }} is powered off"
-        - meta: end_host
-      when: not is_powered_on
-
     # =========================================================================
-    # STEP 5: CHECK FOR EXISTING SNAPSHOTS
+    # STEP 6: CHECK FOR EXISTING SNAPSHOTS
     # =========================================================================
     - name: Check for existing snapshots
       set_fact:
@@ -146,6 +177,7 @@
             msg:
               - "=========================================="
               - "⊘ SKIPPED: Snapshot already exists"
+              - "=========================================="
               - "VM: {{ vm_name }}"
               - "Datacenter: {{ vm_datacenter }}"
               - "Existing snapshots: {{ vm_info.instance.snapshot.rootSnapshotList | length }}"
@@ -154,7 +186,7 @@
       when: has_existing_snapshot
 
     # =========================================================================
-    # STEP 6: EXTRACT STORAGE INFO
+    # STEP 7: EXTRACT STORAGE INFO
     # =========================================================================
     - name: Check if storage info is available
       set_fact:
@@ -196,7 +228,7 @@
           - "Datastores: {{ vm_datastore_names | join(', ') }}"
 
     # =========================================================================
-    # STEP 7: GET DATASTORE DETAILS (GLOBAL QUERY)
+    # STEP 8: GET DATASTORE DETAILS (GLOBAL QUERY)
     # =========================================================================
     - name: Get all datastores from vCenter
       community.vmware.vmware_datastore_info:
@@ -223,7 +255,7 @@
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # =========================================================================
-    # STEP 8: BUILD DATASTORE MAPPING
+    # STEP 9: BUILD DATASTORE MAPPING
     # =========================================================================
     - name: Trim whitespace from VM datastore names
       set_fact:
@@ -283,7 +315,7 @@
         label: "{{ item.name }}"
 
     # =========================================================================
-    # STEP 9: ANALYZE DATASTORE SPACE
+    # STEP 10: ANALYZE DATASTORE SPACE
     # =========================================================================
     - name: Calculate required space for snapshot
       set_fact:
@@ -315,8 +347,9 @@
       debug:
         msg: |
           ==========================================
-          Datastore Space Analysis for {{ vm_name }}
+          Datastore Space Analysis
           ==========================================
+          VM: {{ vm_name }}
           Datacenter: {{ vm_datacenter }}
           Folder: {{ vm_folder }}
           
@@ -388,9 +421,9 @@
           ==========================================
 
     # =========================================================================
-    # STEP 10: CREATE SNAPSHOT USING UUID (WORKS ACROSS ALL DATACENTERS)
+    # STEP 11: CREATE SNAPSHOT USING UUID (WORKS ACROSS ALL DATACENTERS)
     # =========================================================================
-    - name: Create VM snapshot using UUID
+    - name: Create VM snapshot using UUID (no datacenter needed)
       community.vmware.vmware_guest_snapshot:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
@@ -407,7 +440,7 @@
       ignore_errors: yes
 
     # =========================================================================
-    # STEP 11: REPORT RESULTS
+    # STEP 12: REPORT RESULTS
     # =========================================================================
     - name: Report snapshot success
       debug:
