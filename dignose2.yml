@@ -428,14 +428,15 @@
           ==========================================
 
     # =========================================================================
-    # STEP 11: CREATE SNAPSHOT USING UUID (WORKS ACROSS ALL DATACENTERS)
+    # STEP 11: CREATE SNAPSHOT USING UUID WITH AUTO-DISCOVERED DATACENTER
     # =========================================================================
-    - name: Create VM snapshot using UUID (no datacenter parameter needed)
+    - name: Create VM snapshot using UUID and auto-discovered datacenter
       community.vmware.vmware_guest_snapshot:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
         password: "{{ vcenter_password }}"
         validate_certs: no
+        datacenter: "{{ vm_datacenter }}"
         uuid: "{{ target_vm.uuid }}"
         state: present
         snapshot_name: "{{ snapshot_name }}"
