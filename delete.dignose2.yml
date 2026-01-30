@@ -1,0 +1,285 @@
+---
+- name: VMware Snapshot Deletion with Full Auto-Discovery (Production)
+  hosts: all
+  gather_facts: no
+  connection: local
+  serial: 5
+  
+  vars:
+    snapshot_name: "Snapshot for patching"
+    
+    # Only use vCenter connection details from credential
+    # IGNORE datacenter and folder from credential - we auto-discover them
+    vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
+    vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
+    vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
+
+  tasks:
+    - name: Display execution info
+      debug:
+        msg:
+          - "=========================================="
+          - "VMware Snapshot Deletion - Auto Discovery"
+          - "=========================================="
+          - "Target VM: {{ inventory_hostname }}"
+          - "vCenter: {{ vcenter_hostname }}"
+          - "Snapshot to delete: {{ snapshot_name }}"
+          - "Mode: Auto-discover datacenter and folder"
+          - "=========================================="
+
+    # =========================================================================
+    # STEP 1: FIND VM ACROSS ALL DATACENTERS (NO DATACENTER FILTER)
+    # =========================================================================
+    - name: Search for VM across all datacenters and folders
+      community.vmware.vmware_vm_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        vm_type: vm
+      delegate_to: localhost
+      register: all_vms_info
+      ignore_errors: yes
+
+    - name: Check if VM search succeeded
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ ERROR: Failed to query VMs from vCenter"
+              - "=========================================="
+              - "vCenter: {{ vcenter_hostname }}"
+              - "Cannot search for VMs"
+              - "Check vCenter credentials and connectivity"
+              - "=========================================="
+        - meta: end_host
+      when: all_vms_info is failed
+
+    - name: Display total VMs found
+      debug:
+        msg: "Total VMs visible in vCenter: {{ all_vms_info.virtual_machines | length }}"
+
+    # =========================================================================
+    # STEP 2: FIND THE SPECIFIC VM BY NAME
+    # =========================================================================
+    - name: Filter to find our target VM by name
+      set_fact:
+        matching_vms: "{{ all_vms_info.virtual_machines | selectattr('guest_name', 'equalto', inventory_hostname) | list }}"
+      when: all_vms_info.virtual_machines is defined
+
+    - name: Check if VM was found
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ VM NOT FOUND"
+              - "=========================================="
+              - "Looking for VM: {{ inventory_hostname }}"
+              - "vCenter: {{ vcenter_hostname }}"
+              - ""
+              - "This VM does not exist in vCenter"
+              - "or the service account cannot see it."
+              - ""
+              - "Total VMs visible: {{ all_vms_info.virtual_machines | length }}"
+              - ""
+              - "Troubleshooting:"
+              - "1. Verify VM name matches exactly (case-sensitive)"
+              - "2. Check service account has permissions"
+              - "3. Confirm VM exists in vCenter"
+              - "=========================================="
+        - meta: end_host
+      when: matching_vms is not defined or matching_vms | length == 0
+
+    - name: Set target VM
+      set_fact:
+        target_vm: "{{ matching_vms[0] }}"
+
+    - name: Display discovered VM information
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ VM FOUND - AUTO-DISCOVERED LOCATION"
+          - "=========================================="
+          - "VM Name      : {{ target_vm.guest_name }}"
+          - "UUID         : {{ target_vm.uuid }}"
+          - "Power State  : {{ target_vm.power_state }}"
+          - "Datacenter   : {{ target_vm.datacenter }}"
+          - "Folder       : {{ target_vm.folder }}"
+          - "Cluster      : {{ target_vm.cluster | default('N/A') }}"
+          - "ESXi Host    : {{ target_vm.esxi_hostname }}"
+          - "=========================================="
+
+    # =========================================================================
+    # STEP 3: GET DETAILED VM INFO USING UUID
+    # =========================================================================
+    - name: Get detailed VM information using UUID (works across all datacenters)
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        uuid: "{{ target_vm.uuid }}"
+        schema: vsphere
+      delegate_to: localhost
+      register: vm_info
+      ignore_errors: yes
+
+    - name: Check VM detailed info retrieval
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ ERROR: Failed to get detailed VM info"
+              - "=========================================="
+              - "VM: {{ inventory_hostname }}"
+              - "UUID: {{ target_vm.uuid }}"
+              - "=========================================="
+        - meta: end_host
+      when: vm_info is failed or vm_info.instance is not defined
+
+    # =========================================================================
+    # STEP 4: EXTRACT VM FACTS
+    # =========================================================================
+    - name: Set VM facts from detailed info
+      set_fact:
+        vm_moid: "{{ vm_info.instance._vimref.split(':')[1] }}"
+        vm_name: "{{ vm_info.instance.name }}"
+        vm_datacenter: "{{ target_vm.datacenter }}"
+        vm_folder: "{{ target_vm.folder }}"
+        vm_esxi_host: "{{ target_vm.esxi_hostname }}"
+
+    # =========================================================================
+    # STEP 5: CHECK FOR EXISTING SNAPSHOTS
+    # =========================================================================
+    - name: Check for existing snapshots
+      set_fact:
+        has_snapshots: "{{ vm_info.instance.snapshot is defined and vm_info.instance.snapshot.rootSnapshotList is defined and vm_info.instance.snapshot.rootSnapshotList | length > 0 }}"
+
+    - name: Skip if no snapshots exist
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "⊘ SKIPPED: No snapshots exist"
+              - "=========================================="
+              - "VM: {{ vm_name }}"
+              - "Datacenter: {{ vm_datacenter }}"
+              - "Folder: {{ vm_folder }}"
+              - "No snapshots found on this VM"
+              - "=========================================="
+        - meta: end_host
+      when: not has_snapshots
+
+    # =========================================================================
+    # STEP 6: LIST EXISTING SNAPSHOTS
+    # =========================================================================
+    - name: Extract snapshot names
+      set_fact:
+        existing_snapshots: "{{ vm_info.instance.snapshot.rootSnapshotList | map(attribute='name') | list }}"
+      when: has_snapshots
+
+    - name: Display existing snapshots
+      debug:
+        msg:
+          - "=========================================="
+          - "Existing Snapshots on {{ vm_name }}"
+          - "=========================================="
+          - "Total snapshots: {{ existing_snapshots | length }}"
+          - "Snapshot names:"
+          - "{{ existing_snapshots | to_nice_yaml }}"
+          - "Target snapshot to delete: {{ snapshot_name }}"
+          - "=========================================="
+
+    # =========================================================================
+    # STEP 7: CHECK IF TARGET SNAPSHOT EXISTS
+    # =========================================================================
+    - name: Check if target snapshot exists
+      set_fact:
+        snapshot_exists: "{{ snapshot_name in existing_snapshots }}"
+
+    - name: Skip if target snapshot does not exist
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "⊘ SKIPPED: Target snapshot not found"
+              - "=========================================="
+              - "VM: {{ vm_name }}"
+              - "Datacenter: {{ vm_datacenter }}"
+              - "Looking for: {{ snapshot_name }}"
+              - ""
+              - "Existing snapshots:"
+              - "{{ existing_snapshots | to_nice_yaml }}"
+              - ""
+              - "The snapshot '{{ snapshot_name }}' does not exist"
+              - "Nothing to delete"
+              - "=========================================="
+        - meta: end_host
+      when: not snapshot_exists
+
+    - name: Confirm snapshot found
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ SNAPSHOT FOUND"
+          - "=========================================="
+          - "VM: {{ vm_name }}"
+          - "Datacenter: {{ vm_datacenter }}"
+          - "Folder: {{ vm_folder }}"
+          - "Snapshot: {{ snapshot_name }}"
+          - "Proceeding with deletion..."
+          - "=========================================="
+
+    # =========================================================================
+    # STEP 8: DELETE SNAPSHOT USING UUID AND AUTO-DISCOVERED DATACENTER
+    # =========================================================================
+    - name: Delete VM snapshot using UUID and auto-discovered datacenter
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: no
+        datacenter: "{{ vm_datacenter }}"
+        uuid: "{{ target_vm.uuid }}"
+        state: absent
+        snapshot_name: "{{ snapshot_name }}"
+      delegate_to: localhost
+      register: snapshot_result
+      ignore_errors: yes
+
+    # =========================================================================
+    # STEP 9: REPORT RESULTS
+    # =========================================================================
+    - name: Report snapshot deletion success
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ SNAPSHOT DELETED SUCCESSFULLY"
+          - "=========================================="
+          - "VM: {{ vm_name }}"
+          - "Datacenter: {{ vm_datacenter }}"
+          - "Folder: {{ vm_folder }}"
+          - "Deleted Snapshot: {{ snapshot_name }}"
+          - "UUID: {{ target_vm.uuid }}"
+          - "=========================================="
+      when: snapshot_result is succeeded
+
+    - name: Report snapshot deletion failure
+      debug:
+        msg:
+          - "=========================================="
+          - "✗ SNAPSHOT DELETION FAILED"
+          - "=========================================="
+          - "VM: {{ vm_name }}"
+          - "Datacenter: {{ vm_datacenter }}"
+          - "Folder: {{ vm_folder }}"
+          - "UUID: {{ target_vm.uuid }}"
+          - "Snapshot: {{ snapshot_name }}"
+          - "Error: {{ snapshot_result.msg | default('Unknown error') }}"
+          - "=========================================="
+      when: snapshot_result is failed
+
+    - name: Fail the host if snapshot deletion failed
+      fail:
+        msg: "Snapshot deletion failed for {{ vm_name }}"
+      when: snapshot_result is failed
