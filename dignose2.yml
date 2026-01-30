@@ -1,5 +1,5 @@
 ---
-- name: VMware Snapshot with Full Auto-Discovery (Ignores AWX Credential DC/Folder)
+- name: VMware Snapshot with Full Auto-Discovery (Production)
   hosts: all
   gather_facts: no
   connection: local
@@ -11,11 +11,10 @@
     safety_margin_gb: 10
     
     # Only use vCenter connection details from credential
+    # IGNORE datacenter and folder from credential - we auto-discover them
     vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
     vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
     vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
-    # IMPORTANT: We DO NOT use VCENTER_DATACENTER or any folder variables
-    # The playbook discovers these automatically
 
   tasks:
     - name: Display execution info
@@ -127,7 +126,7 @@
       when: target_vm.power_state != 'poweredOn'
 
     # =========================================================================
-    # STEP 4: GET DETAILED VM INFO USING UUID
+    # STEP 4: GET DETAILED VM INFO USING UUID (WORKS ACROSS ALL DATACENTERS)
     # =========================================================================
     - name: Get detailed VM information using UUID (works across all datacenters)
       community.vmware.vmware_guest_info:
@@ -228,9 +227,9 @@
           - "Datastores: {{ vm_datastore_names | join(', ') }}"
 
     # =========================================================================
-    # STEP 8: GET DATASTORE DETAILS (GLOBAL QUERY)
+    # STEP 8: GET DATASTORE DETAILS (GLOBAL QUERY - NO DATACENTER FILTER)
     # =========================================================================
-    - name: Get all datastores from vCenter
+    - name: Get all datastores from vCenter (no datacenter filter)
       community.vmware.vmware_datastore_info:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
@@ -423,7 +422,7 @@
     # =========================================================================
     # STEP 11: CREATE SNAPSHOT USING UUID (WORKS ACROSS ALL DATACENTERS)
     # =========================================================================
-    - name: Create VM snapshot using UUID (no datacenter needed)
+    - name: Create VM snapshot using UUID (no datacenter parameter needed)
       community.vmware.vmware_guest_snapshot:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
