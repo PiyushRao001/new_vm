@@ -105,8 +105,9 @@
           - "UUID         : {{ target_vm.uuid }}"
           - "Power State  : {{ target_vm.power_state }}"
           - "Datacenter   : {{ target_vm.datacenter }}"
-          - "Folder       : {{ target_vm.vm_folder }}"
+          - "Folder       : {{ target_vm.folder }}"
           - "Cluster      : {{ target_vm.cluster | default('N/A') }}"
+          - "ESXi Host    : {{ target_vm.esxi_hostname }}"
           - "=========================================="
 
     # =========================================================================
@@ -156,12 +157,13 @@
     # =========================================================================
     # STEP 5: EXTRACT VM FACTS
     # =========================================================================
-    - name: Set VM facts
+    - name: Set VM facts from detailed info
       set_fact:
         vm_moid: "{{ vm_info.instance._vimref.split(':')[1] }}"
         vm_name: "{{ vm_info.instance.name }}"
         vm_datacenter: "{{ target_vm.datacenter }}"
-        vm_folder: "{{ target_vm.vm_folder }}"
+        vm_folder: "{{ target_vm.folder }}"
+        vm_esxi_host: "{{ target_vm.esxi_hostname }}"
 
     # =========================================================================
     # STEP 6: CHECK FOR EXISTING SNAPSHOTS
@@ -187,17 +189,23 @@
     # =========================================================================
     # STEP 7: EXTRACT STORAGE INFO
     # =========================================================================
-    - name: Check if storage info is available
+    - name: Check if storage info is available from detailed query
       set_fact:
         has_storage_info: "{{ vm_info.instance.storage is defined and vm_info.instance.storage.perDatastoreUsage is defined }}"
 
-    - name: Extract VM storage information
+    - name: Extract VM storage information from detailed query
       set_fact:
         vm_storage_per_ds: "{{ vm_info.instance.storage.perDatastoreUsage | default([]) }}"
         vm_datastore_names: "{{ vm_info.instance.config.datastoreUrl | map(attribute='name') | list }}"
         vm_datastore_refs: "{{ vm_info.instance.datastore }}"
         vm_total_committed_bytes: "{{ vm_info.instance.storage.perDatastoreUsage | map(attribute='committed') | sum }}"
       when: has_storage_info
+
+    - name: Fallback - Extract datastore names from initial VM discovery if detailed query lacks storage info
+      set_fact:
+        vm_datastore_names: "{{ target_vm.datastore_url | map(attribute='name') | list }}"
+        has_storage_info: false
+      when: not has_storage_info and target_vm.datastore_url is defined
 
     - name: Calculate total VM storage
       set_fact:
