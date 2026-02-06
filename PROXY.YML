@@ -1,0 +1,40 @@
+---
+- name: Fix Zabbix Proxy Zombie Mode
+  hosts: "{{ target_hosts }}"
+  gather_facts: no
+  become: yes
+  
+  tasks:
+    - name: Step 1 - Check current proxy status
+      shell: systemctl status zabbix-proxy.service
+      register: status_before
+      failed_when: false
+      changed_when: false
+      
+    - name: Step 2 - Show what we found
+      debug:
+        msg: "Proxy status: {{ 'ZOMBIE/STUCK' if 'deactivating' in status_before.stdout or 'stop-sigterm' in status_before.stdout else 'RUNNING FINE' }}"
+        
+    - name: Step 3 - Kill the zombie process
+      shell: pkill -9 zabbix_proxy
+      when: "'deactivating' in status_before.stdout or 'stop-sigterm' in status_before.stdout"
+      register: kill_action
+      
+    - name: Step 4 - Wait 5 seconds for auto-restart
+      pause:
+        seconds: 5
+      when: kill_action is changed
+      
+    - name: Step 5 - Check status after killing
+      shell: systemctl status zabbix-proxy.service
+      register: status_after
+      failed_when: false
+      changed_when: false
+      
+    - name: Step 6 - Show final result
+      debug:
+        msg: |
+          ========================================
+          HOST: {{ inventory_hostname }}
+          RESULT: {{ 'FIXED - NOW ACTIVE' if 'active (running)' in status_after.stdout else 'STILL HAVING ISSUES' }}
+          ========================================
