@@ -128,8 +128,13 @@
     # -------------------------------------------------------------------------
     # STEP 4.1: SKIP SNAPSHOT IF VM STORAGE >= 2 TB
     # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 4.1: SKIP SNAPSHOT IF VM STORAGE >= 2 TB
+    # -------------------------------------------------------------------------
     - name: Skip if VM total storage is >= 2 TB
       block:
+        - set_fact:
+            skip_reason: "Skipped - VM storage {{ vm_total_committed_gb }} GB exceeds allowed maximum of 2048 GB (2 TB)"
         - debug:
             msg:
               - "=========================================="
