@@ -345,6 +345,6 @@
           - "VM: {{ vm_name }}"
           - "Snapshot Name: {{ snapshot_name }}"
           - "VM Total Storage: {{ vm_total_committed_gb }} GB"
-          - "Snapshot Timestamp: {{ snapshot_result.snapshot_results.creation_time | default(snapshot_result.snapshot_results[0].creation_time) | default('N/A') }}"
+          - "Snapshot Timestamp: {{ snapshot_result.snapshot_results.current_snapshot.creation_time }}"
           - "=========================================="
       when:
