@@ -261,6 +261,7 @@
           - "Folder: {{ vm_folder }}"
           - "Deleted Snapshot: {{ snapshot_name }}"
           - "UUID: {{ target_vm.uuid }}"
+          - "Snapshot Timestamp: {{ snapshot_result.snapshot_results.current_snapshot.creation_time }}"
           - "=========================================="
       when: snapshot_result is succeeded
 
