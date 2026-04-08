@@ -277,6 +277,7 @@
           - "UUID: {{ target_vm.uuid }}"
           - "Snapshot: {{ snapshot_name }}"
           - "Error: {{ snapshot_result.msg | default('Unknown error') }}"
+          - "Snapshot Timestamp: {{ snapshot_result.snapshot_results.current_snapshot.creation_time }}"
           - "=========================================="
       when: snapshot_result is failed
 
