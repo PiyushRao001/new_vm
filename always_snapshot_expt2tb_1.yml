@@ -116,10 +116,13 @@
           - "Datastores: {{ vm_datastore_names | join(', ') }}"
 
     # -------------------------------------------------------------------------
-    # STEP 5: SKIP IF VM STORAGE >= 2 TB  ← BEFORE ANY DATASTORE QUERIES
+    # STEP 5: SKIP IF VM STORAGE >= 2 TB
     # -------------------------------------------------------------------------
     - name: Skip if VM total storage is >= 2 TB
       block:
+        - set_fact:
+            skip_reason: "Skipped - VM storage {{ vm_total_committed_gb }} GB exceeds allowed maximum of 2048 GB (2 TB)"
+            skip_code: "STORAGE_LIMIT_EXCEEDED"
         - debug:
             msg:
               - "=========================================="
@@ -129,6 +132,7 @@
               - "VM Total Storage : {{ vm_total_committed_gb }} GB"
               - "Allowed Maximum  : 2048 GB (2 TB)"
               - "Reason: Snapshot not allowed for VMs with storage >= 2 TB"
+              - "Skip Code: STORAGE_LIMIT_EXCEEDED"
               - "=========================================="
         - meta: end_host
       when: (vm_total_committed_gb | float) >= 2048
