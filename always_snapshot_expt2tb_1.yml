@@ -56,15 +56,25 @@
           - "MOID: {{ vm_moid }}"
           - "Power: {{ vm_power_state }}"
 
+    # -------------------------------------------------------------------------
+    # STEP 3: SKIP IF POWERED OFF
+    # -------------------------------------------------------------------------
     - name: Skip if powered off
       block:
         - debug:
-            msg: "⊘ SKIPPED: {{ vm_name }} is powered off"
+            msg:
+              - "=========================================="
+              - "⊘ SKIPPED: VM is powered off"
+              - "=========================================="
+              - "VM: {{ vm_name }}"
+              - "Power State: {{ vm_power_state }}"
+              - "Reason: Snapshot only taken for powered-on VMs"
+              - "=========================================="
         - meta: end_host
       when: not is_powered_on
 
     # -------------------------------------------------------------------------
-    # STEP 3: EXTRACT STORAGE INFO FROM VSPHERE DATA
+    # STEP 4: EXTRACT STORAGE INFO & CHECK 2TB LIMIT  ← EARLY EXIT
     # -------------------------------------------------------------------------
     - name: Check if storage info is available
       set_fact:
@@ -100,13 +110,31 @@
 
     - name: Display VM total storage
       debug:
-        msg: 
+        msg:
           - "VM Total Committed Storage: {{ vm_total_committed_gb }} GB"
           - "VM uses {{ vm_storage_per_ds | length }} datastore(s)"
           - "Datastores: {{ vm_datastore_names | join(', ') }}"
 
     # -------------------------------------------------------------------------
-    # STEP 4: GET DATASTORE DETAILS (WITHOUT DATACENTER FILTER)
+    # STEP 5: SKIP IF VM STORAGE >= 2 TB  ← BEFORE ANY DATASTORE QUERIES
+    # -------------------------------------------------------------------------
+    - name: Skip if VM total storage is >= 2 TB
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "⊘ SKIPPED: VM storage exceeds limit"
+              - "=========================================="
+              - "VM: {{ vm_name }}"
+              - "VM Total Storage : {{ vm_total_committed_gb }} GB"
+              - "Allowed Maximum  : 2048 GB (2 TB)"
+              - "Reason: Snapshot not allowed for VMs with storage >= 2 TB"
+              - "=========================================="
+        - meta: end_host
+      when: (vm_total_committed_gb | float) >= 2048
+
+    # -------------------------------------------------------------------------
+    # STEP 6: GET DATASTORE DETAILS (WITHOUT DATACENTER FILTER)
     # -------------------------------------------------------------------------
     - name: Get all datastores (global query - no datacenter filter)
       community.vmware.vmware_datastore_info:
@@ -133,7 +161,7 @@
       when: all_datastores_info is failed or all_datastores_info.datastores is not defined
 
     # -------------------------------------------------------------------------
-    # STEP 5: BUILD DATASTORE MAPPING
+    # STEP 7: BUILD DATASTORE MAPPING
     # -------------------------------------------------------------------------
     - name: Trim whitespace from VM datastore names
       set_fact:
@@ -194,7 +222,7 @@
         label: "{{ item.name }}"
 
     # -------------------------------------------------------------------------
-    # STEP 6: ANALYZE DATASTORE SPACE - CHECK EACH DATASTORE
+    # STEP 8: ANALYZE DATASTORE SPACE
     # -------------------------------------------------------------------------
     - name: Calculate required space for snapshot (total VM storage + margin)
       set_fact:
@@ -218,7 +246,7 @@
       loop: "{{ vm_datastore_names_clean }}"
       loop_control:
         label: "{{ item }}"
-      when: 
+      when:
         - ds_name_to_details is defined
         - item in ds_name_to_details
 
@@ -293,27 +321,7 @@
           ==========================================
 
     # -------------------------------------------------------------------------
-    # STEP 7: SKIP SNAPSHOT IF VM STORAGE >= 2 TB
-    # -------------------------------------------------------------------------
-    - name: Skip if VM total storage is >= 2 TB
-      block:
-        - set_fact:
-            skip_reason: "Skipped - VM storage {{ vm_total_committed_gb }} GB exceeds allowed maximum of 2048 GB (2 TB)"
-        - debug:
-            msg:
-              - "=========================================="
-              - "⊘ SKIPPED: VM storage exceeds limit"
-              - "=========================================="
-              - "VM: {{ vm_name }}"
-              - "VM Total Storage : {{ vm_total_committed_gb }} GB"
-              - "Allowed Maximum  : 2048 GB (2 TB)"
-              - "Reason: Snapshot not allowed for VMs with storage >= 2 TB"
-              - "=========================================="
-        - meta: end_host
-      when: (vm_total_committed_gb | float) >= 2048
-
-    # -------------------------------------------------------------------------
-    # STEP 8: CREATE SNAPSHOT
+    # STEP 9: CREATE SNAPSHOT
     # -------------------------------------------------------------------------
     - name: Create VM snapshot using MOID
       community.vmware.vmware_guest_snapshot:
@@ -333,7 +341,7 @@
       ignore_errors: yes
 
     # -------------------------------------------------------------------------
-    # STEP 9: REPORT RESULTS
+    # STEP 10: REPORT RESULTS
     # -------------------------------------------------------------------------
     - name: Report snapshot created successfully
       debug:
@@ -344,7 +352,7 @@
           - "VM: {{ vm_name }}"
           - "Snapshot Name: {{ snapshot_name }}"
           - "VM Total Storage: {{ vm_total_committed_gb }} GB"
-          - "Snapshot Timestamp: {{ snapshot_result.snapshot_results.current_snapshot.creation_time }}"
+          - "Snapshot Timestamp: {{ snapshot_result.snapshot_results.current_snapshot.creation_time | default('N/A') }}"
           - "=========================================="
       when: snapshot_result is succeeded and snapshot_result.changed
 
