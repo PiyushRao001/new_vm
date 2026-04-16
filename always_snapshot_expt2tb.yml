@@ -335,7 +335,20 @@
     # -------------------------------------------------------------------------
     # STEP 9: REPORT RESULTS
     # -------------------------------------------------------------------------
-    - name: Report snapshot success
+    - name: Report snapshot already exists (no change)
+      debug:
+        msg:
+          - "=========================================="
+          - "⊘ SNAPSHOT ALREADY EXISTS - NO ACTION TAKEN"
+          - "=========================================="
+          - "VM: {{ vm_name }}"
+          - "Snapshot Name: {{ snapshot_name }}"
+          - "VM Total Storage: {{ vm_total_committed_gb }} GB"
+          - "Info: {{ snapshot_result.msg }}"
+          - "=========================================="
+      when: snapshot_result is succeeded and not snapshot_result.changed
+
+    - name: Report snapshot created successfully
       debug:
         msg:
           - "=========================================="
@@ -346,4 +359,15 @@
           - "VM Total Storage: {{ vm_total_committed_gb }} GB"
           - "Snapshot Timestamp: {{ snapshot_result.snapshot_results.current_snapshot.creation_time }}"
           - "=========================================="
-      when: snapshot_result is succeeded
+      when: snapshot_result is succeeded and snapshot_result.changed
+
+    - name: Report snapshot creation failed
+      debug:
+        msg:
+          - "=========================================="
+          - "✗ SNAPSHOT CREATION FAILED"
+          - "=========================================="
+          - "VM: {{ vm_name }}"
+          - "Error: {{ snapshot_result.msg | default('Unknown error') }}"
+          - "=========================================="
+      when: snapshot_result is failed
