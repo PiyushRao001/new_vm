@@ -2,7 +2,6 @@
 - name: Delete VMware snapshots for AWX inventory hosts
   hosts: all
   gather_facts: no
-
   vars:
     snapshot_name: "Snapshot for patching"
     vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
@@ -12,7 +11,88 @@
     vm_folder: "{{ lookup('env', 'VCENTER_VM_FOLDER') }}"
 
   tasks:
-    - name: Delete snapshot for each inventory host
+
+    # -------------------------------------------------------------------------
+    # STEP 1: GET VM SNAPSHOT INFO BEFORE DELETE
+    # -------------------------------------------------------------------------
+    - name: Get current snapshot info for VM
+      community.vmware.vmware_guest_snapshot_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        datacenter: "{{ datacenter_name }}"
+        folder: "{{ vm_folder }}"
+        validate_certs: no
+        name: "{{ inventory_hostname }}"
+      delegate_to: localhost
+      register: snapshot_info
+      ignore_errors: yes
+
+    - name: Check if snapshot info retrieval failed
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ ERROR: Cannot retrieve snapshot info"
+              - "=========================================="
+              - "VM           : {{ inventory_hostname }}"
+              - "Reason       : vCenter API call failed"
+              - "=========================================="
+        - meta: end_host
+      when: snapshot_info is failed or snapshot_info.guest_snapshots is not defined
+
+    # -------------------------------------------------------------------------
+    # STEP 2: CHECK IF TARGET SNAPSHOT EXISTS
+    # -------------------------------------------------------------------------
+    - name: Find matching snapshot by name
+      set_fact:
+        matched_snapshots: >-
+          {{
+            snapshot_info.guest_snapshots.snapshots
+            | default([])
+            | selectattr('name', 'equalto', snapshot_name)
+            | list
+          }}
+
+    - name: Fail if snapshot does not exist
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ FAILED: SNAPSHOT NOT FOUND"
+              - "=========================================="
+              - "VM            : {{ inventory_hostname }}"
+              - "Snapshot Name : {{ snapshot_name }}"
+              - "Reason        : No snapshot with this name exists on the VM."
+              - "Total Snapshots on VM: {{ snapshot_info.guest_snapshots.snapshots | default([]) | length }}"
+              - "=========================================="
+        - fail:
+            msg: "SNAPSHOT_NOT_FOUND: Snapshot '{{ snapshot_name }}' does not exist on {{ inventory_hostname }}"
+      when: matched_snapshots | length == 0
+
+    - name: Show snapshot found confirmation
+      debug:
+        msg:
+          - "=========================================="
+          - "✓ SNAPSHOT FOUND - Proceeding with deletion"
+          - "=========================================="
+          - "VM            : {{ inventory_hostname }}"
+          - "Snapshot Name : {{ matched_snapshots[0].name }}"
+          - "Created At    : {{ matched_snapshots[0].creation_time }}"
+          - "Description   : {{ matched_snapshots[0].description | default('N/A') }}"
+          - "=========================================="
+
+    # -------------------------------------------------------------------------
+    # STEP 3: RECORD DELETION START TIME
+    # -------------------------------------------------------------------------
+    - name: Record deletion start timestamp
+      set_fact:
+        deletion_start_time: "{{ lookup('pipe', 'date -u +\"%Y-%m-%dT%H:%M:%SZ\"') }}"
+
+    # -------------------------------------------------------------------------
+    # STEP 4: DELETE THE SNAPSHOT
+    # -------------------------------------------------------------------------
+    - name: Delete snapshot for VM
       community.vmware.vmware_guest_snapshot:
         hostname: "{{ vcenter_hostname }}"
         username: "{{ vcenter_username }}"
@@ -24,8 +104,36 @@
         state: absent
         snapshot_name: "{{ snapshot_name }}"
       delegate_to: localhost
-      register: delete_results
+      register: delete_result
+      ignore_errors: yes
 
-    - name: Show delete snapshot results
+    # -------------------------------------------------------------------------
+    # STEP 5: REPORT RESULTS WITH TIMESTAMP
+    # -------------------------------------------------------------------------
+    - name: Report snapshot deletion success
       debug:
-        var: delete_results
+        msg:
+          - "=========================================="
+          - "✓ SNAPSHOT DELETED SUCCESSFULLY"
+          - "=========================================="
+          - "VM             : {{ inventory_hostname }}"
+          - "Snapshot Name  : {{ snapshot_name }}"
+          - "Deletion Start : {{ deletion_start_time }}"
+          - "Snapshot Timestamp: {{ deletion_start_time }}"
+          - "=========================================="
+      when: delete_result is succeeded and delete_result.changed
+
+    - name: Report snapshot deletion failed
+      block:
+        - debug:
+            msg:
+              - "=========================================="
+              - "✗ SNAPSHOT DELETION FAILED"
+              - "=========================================="
+              - "VM            : {{ inventory_hostname }}"
+              - "Snapshot Name : {{ snapshot_name }}"
+              - "Error         : {{ delete_result.msg | default('Unknown error') }}"
+              - "=========================================="
+        - fail:
+            msg: "DELETION_FAILED: {{ delete_result.msg | default('Unknown error') }}"
+      when: delete_result is failed
