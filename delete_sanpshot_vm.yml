@@ -1,0 +1,31 @@
+---
+- name: Delete VMware snapshots for AWX inventory hosts
+  hosts: all
+  gather_facts: no
+
+  vars:
+    snapshot_name: "Snapshot for patching"
+    vcenter_hostname: "{{ lookup('env', 'VCENTER_HOSTNAME') }}"
+    vcenter_username: "{{ lookup('env', 'VCENTER_USERNAME') }}"
+    vcenter_password: "{{ lookup('env', 'VCENTER_PASSWORD') }}"
+    datacenter_name: "{{ lookup('env', 'VCENTER_DATACENTER') }}"
+    vm_folder: "{{ lookup('env', 'VCENTER_VM_FOLDER') }}"
+
+  tasks:
+    - name: Delete snapshot for each inventory host
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        datacenter: "{{ datacenter_name }}"
+        folder: "{{ vm_folder }}"
+        validate_certs: no
+        name: "{{ inventory_hostname }}"
+        state: absent
+        snapshot_name: "{{ snapshot_name }}"
+      delegate_to: localhost
+      register: delete_results
+
+    - name: Show delete snapshot results
+      debug:
+        var: delete_results
