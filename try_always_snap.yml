@@ -6,7 +6,7 @@
   serial: 5
   
   vars:
-    snapshot_name: "Snapshot for patching"
+    snapshot_name: "Snapshot for patching - {{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
     snapshot_desc: "Created by Ansible via AWX for Patching Maintenance"
     safety_margin_gb: 10
     
